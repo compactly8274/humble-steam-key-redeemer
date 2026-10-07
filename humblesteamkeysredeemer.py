@@ -12,10 +12,10 @@ import os
 import json
 import re
 import sys
+import traceback
 import unicodedata
 import webbrowser
 from base64 import b64encode
-from concurrent.futures import ThreadPoolExecutor
 import atexit
 import signal
 from http.client import responses
@@ -94,12 +94,39 @@ def send_api_request(data, steam_api_interface, steam_api_method, steam_api_vers
 wa.WebAuth.send_api_request = staticmethod(send_api_request)
 
 ERROR_LOG_FILE = "error.log"
+
+# Per-app name lookups are rate-limited by Steam; see fetch_app_names.
+APPDETAILS_MAX_LOOKUPS = 50
+APPDETAILS_DELAY = 0.3
+
+# Set in __main__. None while the module is merely imported, so log() stays quiet
+# for anything that pulls these helpers in without wanting a log file.
+LOG_STREAM = None
 _output_files = {}
 
 
-def _open_output_file(filename):
+def log(message):
+    """Append a timestamped line to error.log.
+
+    The log is the run's only record once the console scrolls away, so it carries
+    progress and decisions as well as failures. Writes are line-buffered and
+    flushed: a run that dies mid-way still leaves everything up to that point.
+    """
+    if LOG_STREAM is None:
+        return
+    try:
+        LOG_STREAM.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
+        LOG_STREAM.flush()
+    except Exception:
+        # Logging must never be the thing that breaks a run.
+        pass
+
+
+def _open_output_file(filename, newline=None):
     if filename not in _output_files:
-        _output_files[filename] = open(filename, "a", encoding="utf-8-sig")
+        _output_files[filename] = open(
+            filename, "a", encoding="utf-8-sig", newline=newline
+        )
     return _output_files[filename]
 
 
@@ -607,26 +634,25 @@ def _redeem_steam(session, key, quiet=False):
         return error_code
 
 
-files = {}
+# write_key writes through _open_output_file so close_output_files() actually
+# closes these; it previously kept a second, separate dict.
 
 
 def write_key(code, key):
-    global files
-
     filename = "redeemed.csv"
     if code == 15 or code == 9:
         filename = "already_owned.csv"
     elif code != 0:
         filename = "errored.csv"
 
-    if filename not in files:
-        files[filename] = open(filename, "a", encoding="utf-8-sig", newline="")
-    writer = csv.writer(files[filename])
+    handle = _open_output_file(filename, newline="")
+    writer = csv.writer(handle)
     gamekey = key.get("gamekey")
     human_name = key.get("human_name", "")
     redeemed_key_val = key.get("redeemed_key_val")
     writer.writerow([gamekey, human_name, redeemed_key_val])
-    files[filename].flush()
+    handle.flush()
+    log(f"key result: code={code} file={filename} name={human_name!r}")
 
 
 def prompt_skipped(skipped_games):
@@ -731,29 +757,69 @@ def fetch_steam_catalog(steam_session, api_key):
         params["last_appid"] = response.get("last_appid", params["last_appid"])
 
     print(f"Fetched {len(catalog)} apps from the Steam catalogue.")
+    log(f"catalogue fetched: {len(catalog)} apps")
     return catalog
 
 
 def fetch_app_names(steam_session, app_ids):
-    # GetAppList omits store-delisted apps, so resolve the stragglers individually.
+    """Best-effort names for owned apps the catalogue omits (store-delisted ones).
+
+    store/api/appdetails is one request per app and throttled hard -- a few hundred
+    rapid calls earn a 403 for the whole IP, which then also blocks the title search
+    the key-less path depends on. These names only sharpen title matching, so this
+    stays small, paces itself, and gives up quietly rather than stalling the run.
+    """
     if not app_ids:
         return {}
 
-    def fetch(appid):
+    if len(app_ids) > APPDETAILS_MAX_LOOKUPS:
+        message = (
+            f"{len(app_ids)} owned apps are missing from the Steam catalogue "
+            f"(usually store-delisted). Skipping per-app name lookups: more than "
+            f"{APPDETAILS_MAX_LOOKUPS} would get this IP throttled. Exact app-id "
+            f"matching is unaffected."
+        )
+        print(message)
+        log(message)
+        return {}
+
+    names = {}
+    for appid in app_ids:
         try:
             resp = steam_session.get(
                 STEAM_APP_DETAILS_API, params={"appids": appid}, timeout=20
-            ).json()
-        except Exception:
-            return None
-        entry = resp.get(str(appid)) or {}
+            )
+        except requests.RequestException as e:
+            log(f"appdetails {appid}: request failed: {e}")
+            continue
+
+        if resp.status_code in (403, 429):
+            message = (
+                f"Steam is throttling app-detail lookups (HTTP {resp.status_code}); "
+                f"resolved {len(names)} of {len(app_ids)} names before stopping."
+            )
+            print(message)
+            log(message)
+            break
+
+        try:
+            body = resp.json()
+        except ValueError:
+            log(f"appdetails {appid}: non-JSON response (HTTP {resp.status_code})")
+            continue
+
+        # appdetails answers a bare `null` for some app ids, so body itself can be
+        # None. Indexing it directly is what raised
+        # "'NoneType' object has no attribute 'get'" mid-run.
+        entry = (body or {}).get(str(appid)) or {}
         name = (entry.get("data") or {}).get("name") if entry.get("success") else None
-        return (appid, name) if name else None
+        if name:
+            names[appid] = name
 
-    with ThreadPoolExecutor(max_workers=min(8, len(app_ids))) as pool:
-        results = pool.map(fetch, app_ids)
+        time.sleep(APPDETAILS_DELAY)
 
-    return dict(r for r in results if r is not None)
+    log(f"appdetails: resolved {len(names)} of {len(app_ids)} missing names")
+    return names
 
 
 def search_owned_candidates(steam_session, game_name, owned_app_ids, cache):
@@ -828,6 +894,10 @@ def get_owned_apps(steam_session):
     unresolved = len(owned_app_ids) - len(owned_app_details)
     if unresolved:
         print(f"Warning: couldn't resolve names for {unresolved} of your owned apps.")
+    log(
+        f"ownership data: {len(owned_app_ids)} owned app ids, "
+        f"{len(owned_app_details)} with names, {unresolved} unresolved"
+    )
 
     return owned_app_ids, owned_app_details
 
@@ -1005,6 +1075,11 @@ def redeem_steam_keys(humble_session, humble_keys):
             unownedgames.append(game)
 
     write_ownership_report(report_rows)
+    log(
+        f"ownership decisions: {len(skipped_games)} owned (skipped), "
+        f"{uncertain_count} uncertain (attempted), "
+        f"{len(unownedgames)} to attempt of {len(noted_keys)} considered"
+    )
 
     print(
         "Filtered out game keys that you already own on Steam; {} keys unowned.".format(
@@ -1349,13 +1424,41 @@ def main():
 
 
 if __name__=="__main__":
-    sys.stderr = open(ERROR_LOG_FILE, 'a')
+    console_stderr = sys.stderr
+    # Line-buffered: a hard crash still leaves every line already written on disk.
+    LOG_STREAM = open(ERROR_LOG_FILE, "a", buffering=1, encoding="utf-8")
+    sys.stderr = LOG_STREAM
+
+    log("=" * 70)
+    log(f"run started -- python {sys.version.split()[0]}, args {sys.argv[1:] or 'none'}")
+
+    exit_code = 0
     try:
         main()
+        log("run finished normally")
+    except SystemExit as e:
+        exit_code = e.code if isinstance(e.code, int) else 0
+        log(f"run exited early (code {exit_code})")
+    except BaseException:
+        # Report while the log is still open, and to the terminal as well. The
+        # previous arrangement closed sys.stderr in `finally`, so by the time the
+        # interpreter tried to print the traceback it had nowhere to put it and
+        # emitted "lost sys.stderr" plus a raw object dump instead.
+        trace = traceback.format_exc()
+        log("run FAILED:\n" + trace)
+        exit_code = 1
+        try:
+            console_stderr.write("\n" + trace)
+            console_stderr.write(f"\nThis traceback was also written to {ERROR_LOG_FILE}.\n")
+            console_stderr.flush()
+        except Exception:
+            pass
     finally:
         close_output_files()
-        if sys.stderr is not None and sys.stderr != sys.__stderr__:
-            try:
-                sys.stderr.close()
-            except Exception:
-                pass
+        sys.stderr = console_stderr
+        try:
+            LOG_STREAM.close()
+        except Exception:
+            pass
+
+    sys.exit(exit_code)

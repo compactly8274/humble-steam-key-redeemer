@@ -151,3 +151,5 @@ dmypy.json
 
 .idea/
 .humblecookies
+# Steam Web API key (optional, used by get_owned_apps) -- never commit this
+steam_api_key.txt

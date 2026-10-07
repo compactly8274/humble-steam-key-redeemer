@@ -3,6 +3,7 @@ from selenium import webdriver
 from selenium.common.exceptions import WebDriverException
 from fuzzywuzzy import fuzz
 import steam.webauth as wa
+from steam.enums import EResult
 import time
 import pickle
 from pwinput import pwinput
@@ -12,12 +13,83 @@ import sys
 import webbrowser
 import os
 from base64 import b64encode
+from concurrent.futures import ThreadPoolExecutor
 import atexit
 import signal
 from http.client import responses
 
 #patch steam webauth for password feedback
 wa.getpass = pwinput
+
+# Patch steam webauth to report why a login was refused.
+# Valve answers a rejected BeginAuthSessionViaCredentials with HTTP 200 and an empty
+# {"response":{}} body, putting the real reason in the x-eresult header. The library
+# ignores that header and indexes resp['response']['client_id'], so every refusal
+# surfaced as an opaque KeyError instead of "wrong password".
+ERESULT_CHECKED_METHODS = {"BeginAuthSessionViaCredentials"}
+MAX_STEAM_PASSWORD_ATTEMPTS = 3
+steam_refusals = {"invalid_password": 0}
+
+
+def steam_api_error(method, eresult, message):
+    try:
+        result = EResult(int(eresult))
+    except (TypeError, ValueError):
+        result = None
+
+    detail = message or (result.name if result else f"x-eresult={eresult}")
+
+    if result == EResult.InvalidPassword:
+        steam_refusals["invalid_password"] += 1
+        if steam_refusals["invalid_password"] >= MAX_STEAM_PASSWORD_ATTEMPTS:
+            # Steam reports a bad username with this same code, so stop looping and
+            # let the user re-check the name rather than retyping the password forever.
+            return wa.WebAuthException(
+                f"Steam rejected these credentials {steam_refusals['invalid_password']} times. "
+                "Check that 'Steam Username' is your account login name, not your email address."
+            )
+        # cli_login catches LoginIncorrect and re-prompts for the password.
+        return wa.LoginIncorrect(
+            "Steam rejected these credentials. Note that 'Steam Username' is your "
+            "account login name, not the email address you sign in with."
+        )
+    if result == EResult.RateLimitExceeded:
+        return wa.WebAuthException(
+            "Steam is rate-limiting login attempts from this IP. Wait ~30 minutes and retry."
+        )
+    return wa.WebAuthException(f"Steam refused {method}: {detail}")
+
+
+def send_api_request(data, steam_api_interface, steam_api_method, steam_api_version):
+    url = wa.API_URL.format(steam_api_interface, steam_api_method, steam_api_version)
+
+    if steam_api_method == "GetPasswordRSAPublicKey":  # GET, everything else is POST
+        res = requests.get(url, timeout=10, headers=wa.API_HEADERS, params=data)
+    else:
+        res = requests.post(url, timeout=10, headers=wa.API_HEADERS, data=data)
+    res.raise_for_status()
+
+    try:
+        body = res.json()
+    except ValueError:
+        raise wa.WebAuthException(
+            f"Steam returned a non-JSON response for {steam_api_method} "
+            f"(HTTP {res.status_code}): {res.text[:200]}"
+        )
+
+    # Only guard the credentials call -- the 2FA poll relies on an empty response
+    # to signal "still waiting", and must keep raising KeyError for the library.
+    if steam_api_method in ERESULT_CHECKED_METHODS and not body.get("response"):
+        raise steam_api_error(
+            steam_api_method,
+            res.headers.get("x-eresult"),
+            res.headers.get("x-error_message"),
+        )
+
+    return body
+
+
+wa.WebAuth.send_api_request = staticmethod(send_api_request)
 
 if __name__ == "__main__":
     sys.stderr = open('error.log','a')
@@ -40,7 +112,13 @@ HUMBLE_CHOOSE_CONTENT = "https://www.humblebundle.com/humbler/choosecontent"
 STEAM_KEYS_PAGE = "https://store.steampowered.com/account/registerkey"
 STEAM_USERDATA_API = "https://store.steampowered.com/dynamicstore/userdata/"
 STEAM_REDEEM_API = "https://store.steampowered.com/account/ajaxregisterkey/"
-STEAM_APP_LIST_API = "https://api.steampowered.com/ISteamApps/GetAppList/v2/"
+# ISteamApps/GetAppList was removed by Valve (404 "Method 'GetAppList' not found").
+# IStoreService/GetAppList is the replacement but requires a Web API key, so the
+# key-less endpoints below are used when no key is configured.
+STEAM_APP_LIST_API = "https://api.steampowered.com/IStoreService/GetAppList/v1/"
+STEAM_APP_DETAILS_API = "https://store.steampowered.com/api/appdetails"
+STEAM_APP_SEARCH_API = "https://steamcommunity.com/actions/SearchApps/"
+STEAM_API_KEY_FILE = "steam_api_key.txt"
 
 # May actually be able to do without these, but for now they're in.
 headers = {
@@ -166,8 +244,11 @@ def get_headless_driver():
         print("")
         print(browser,exception.msg)
 
-    time.sleep(30)
-    sys.exit()
+    try:
+        time.sleep(30)
+    except KeyboardInterrupt:
+        pass
+    sys.exit(1)
 
 MODE_PROMPT = """Welcome to the Humble Exporter!
 Which key export mode would you like to use?
@@ -329,7 +410,12 @@ def steam_login():
     # Saved state doesn't work, prompt user to sign in.
     s_username = input("Steam Username: ")
     user = wa.WebAuth(s_username)
-    session = user.cli_login()
+    try:
+        session = user.cli_login()
+    except wa.WebAuthException as e:
+        print("")
+        print(f"Could not sign in to Steam: {e}")
+        sys.exit(1)
     export_cookies(".steamcookies", session)
     return session
 
@@ -558,15 +644,164 @@ def prompt_yes_no(question):
         else:
             return True if ans == "y" else False
 
-def get_owned_apps(steam_session):
-    owned_content = steam_session.get(STEAM_USERDATA_API).json()
-    owned_app_ids = owned_content["rgOwnedPackages"] + owned_content["rgOwnedApps"]
-    owned_app_details = {
-        app["appid"]: app["name"]
-        for app in steam_session.get(STEAM_APP_LIST_API).json()["applist"]["apps"]
-        if app["appid"] in owned_app_ids
+def load_steam_api_key():
+    # Optional. With a key we can pull Steam's whole catalogue in a few requests;
+    # without one we fall back to per-title searches.
+    if not os.path.exists(STEAM_API_KEY_FILE):
+        return None
+    try:
+        with open(STEAM_API_KEY_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        print(f"Warning: couldn't read {STEAM_API_KEY_FILE}; falling back to per-title lookups.")
+        return None
+
+
+def steam_json(steam_session, url, what, **kwargs):
+    # Steam hands back HTML error pages and empty bodies often enough that a bare
+    # .json() turns every hiccup into an unreadable JSONDecodeError traceback.
+    try:
+        resp = steam_session.get(url, **kwargs)
+    except requests.RequestException as e:
+        print(f"Error: request for {what} failed: {e}")
+        return None
+    try:
+        return resp.json()
+    except ValueError:
+        preview = " ".join(resp.text[:200].split())
+        print(f"Error: {what} was not JSON (HTTP {resp.status_code}). Body: {preview}")
+        return None
+
+
+def fetch_steam_catalog(steam_session, api_key):
+    # Paginated full catalogue via IStoreService/GetAppList. Returns appid -> name.
+    params = {
+        "key": api_key,
+        "max_results": 50000,
+        "last_appid": 0,
+        "include_games": 1,
+        "include_dlc": 1,
+        "include_software": 1,
+        "include_hardware": 1,
     }
-    return owned_app_details
+
+    print("Fetching the Steam catalogue (this takes a few moments)...")
+    catalog = {}
+    while True:
+        body = steam_json(steam_session, STEAM_APP_LIST_API, "the Steam app list", params=params)
+        if body is None:
+            print("Could not fetch the Steam catalogue; falling back to per-title lookups.")
+            print(f"If your key is wrong or expired, fix or delete {STEAM_API_KEY_FILE}.")
+            return None
+
+        response = body.get("response", {})
+        page = response.get("apps", [])
+        catalog.update({app["appid"]: app["name"] for app in page})
+
+        if not page or not response.get("have_more_results"):
+            break
+        params["last_appid"] = response.get("last_appid", params["last_appid"])
+
+    print(f"Fetched {len(catalog)} apps from the Steam catalogue.")
+    return catalog
+
+
+def fetch_app_names(steam_session, app_ids):
+    # GetAppList omits store-delisted apps, so resolve the stragglers individually.
+    if not app_ids:
+        return {}
+
+    def fetch(appid):
+        try:
+            resp = steam_session.get(
+                STEAM_APP_DETAILS_API, params={"appids": appid}, timeout=20
+            ).json()
+        except Exception:
+            return None
+        entry = resp.get(str(appid)) or {}
+        name = (entry.get("data") or {}).get("name") if entry.get("success") else None
+        return (appid, name) if name else None
+
+    with ThreadPoolExecutor(max_workers=min(8, len(app_ids))) as pool:
+        results = pool.map(fetch, app_ids)
+
+    return dict(r for r in results if r is not None)
+
+
+def search_owned_candidates(steam_session, game_name, owned_app_ids, cache):
+    """Key-less ownership lookup: ask Steam's search for this title, keep what we own.
+
+    Returns appid -> name for matching apps the user already owns, in the same shape
+    the full catalogue would have given, so match_ownership works unchanged.
+    """
+    term = game_name.strip()
+    if term in cache:
+        return cache[term]
+
+    if cache:
+        time.sleep(0.2)  # hundreds of titles in a run; don't get the IP throttled
+
+    results = steam_json(
+        steam_session,
+        STEAM_APP_SEARCH_API + requests.utils.quote(term),
+        f'the Steam search for "{term}"',
+        timeout=20,
+    )
+
+    candidates = {}
+    for app in results or []:
+        try:
+            appid = int(app["appid"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if appid in owned_app_ids:
+            candidates[appid] = app.get("name", "")
+
+    cache[term] = candidates
+    return candidates
+
+
+def get_owned_apps(steam_session):
+    """Return (owned_app_ids, owned_app_details).
+
+    owned_app_details is the appid -> name map for everything owned when a Web API
+    key is configured, or None when callers must fall back to per-title searches.
+    """
+    owned_content = steam_json(steam_session, STEAM_USERDATA_API, "your Steam user data")
+    if owned_content is None or "rgOwnedApps" not in owned_content:
+        print("Could not read your owned Steam apps. Delete .steamcookies and sign in again.")
+        print("Stopping rather than attempting every key: Steam allows only ~10 failed")
+        print("keys per hour, and keys you already own count as failures.")
+        sys.exit(1)
+
+    # Only app IDs: rgOwnedPackages holds package IDs, a different namespace from
+    # the Steam app IDs Humble reports, so comparing against them is meaningless.
+    owned_app_ids = set(owned_content["rgOwnedApps"])
+
+    api_key = load_steam_api_key()
+    if not api_key:
+        print("No Steam Web API key found; matching titles individually instead.")
+        print("For faster matching, put a key from https://steamcommunity.com/dev/apikey")
+        print(f"into {STEAM_API_KEY_FILE}.")
+        return owned_app_ids, None
+
+    catalog = fetch_steam_catalog(steam_session, api_key)
+    if catalog is None:
+        return owned_app_ids, None
+
+    owned_app_details = {
+        appid: catalog[appid] for appid in owned_app_ids if appid in catalog
+    }
+
+    missing = [appid for appid in owned_app_ids if appid not in catalog]
+    if missing:
+        owned_app_details.update(fetch_app_names(steam_session, missing))
+
+    unresolved = len(owned_app_ids) - len(owned_app_details)
+    if unresolved:
+        print(f"Warning: couldn't resolve names for {unresolved} of your owned apps.")
+
+    return owned_app_ids, owned_app_details
 
 def match_ownership(owned_app_details, game, filter_live):
     threshold = 70
@@ -620,9 +855,9 @@ def redeem_steam_keys(humble_session, humble_keys):
     print("Getting your owned content to avoid attempting to register keys already owned...")
 
     # Query owned App IDs according to Steam
-    owned_app_details = get_owned_apps(session)
+    owned_app_ids, owned_app_details = get_owned_apps(session)
 
-    noted_keys = [key for key in humble_keys if key["steam_app_id"] not in owned_app_details.keys()]
+    noted_keys = [key for key in humble_keys if key["steam_app_id"] not in owned_app_ids]
     skipped_games = {}
     unownedgames = []
 
@@ -631,9 +866,18 @@ def redeem_steam_keys(humble_session, humble_keys):
 
     filter_live = prompt_filter_live() == "y"
 
+    search_cache = {}
     for game in noted_keys:
-        best_match = match_ownership(owned_app_details,game,filter_live)
-        if best_match[1] is not None and best_match[1] in owned_app_details.keys():
+        if owned_app_details is None:
+            # No API key: look this one title up instead of scanning a full catalogue.
+            candidates = search_owned_candidates(
+                session, game["human_name"], owned_app_ids, search_cache
+            )
+        else:
+            candidates = owned_app_details
+
+        best_match = match_ownership(candidates,game,filter_live)
+        if best_match[1] is not None and best_match[1] in candidates:
             skipped_games[game["human_name"].strip()] = game
         else:
             unownedgames.append(game)

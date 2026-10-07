@@ -339,20 +339,111 @@ def valid_steam_key(key):
     )
 
 
+# add_cookie only accepts these, and rejects the call outright on anything else.
+SELENIUM_COOKIE_FIELDS = (
+    "name", "value", "path", "domain", "secure", "httpOnly", "expiry", "sameSite",
+)
+
+# The cookie that actually carries a Humble session. Humble issues it with a
+# 90-day lifetime, so a saved session should survive far longer than one run.
+HUMBLE_AUTH_COOKIE = "_simpleauth_sess"
+
+
+def sanitize_cookie(cookie):
+    """Make a stored cookie acceptable to add_cookie, or None to skip it.
+
+    geckodriver raises on an invalid cookie, and because the cookies were
+    restored in one unguarded loop, a single rejected tracker cookie discarded
+    the whole saved session and forced a fresh login every run.
+    """
+    if not isinstance(cookie, dict):
+        return None
+
+    clean = {
+        field: cookie[field]
+        for field in SELENIUM_COOKIE_FIELDS
+        if cookie.get(field) is not None
+    }
+    if not clean.get("name"):
+        return None
+
+    expiry = clean.get("expiry")
+    if expiry is not None:
+        try:
+            expiry = int(expiry)
+        except (TypeError, ValueError):
+            clean.pop("expiry")
+        else:
+            if expiry <= time.time():
+                # Already expired. The browser would drop it anyway, and
+                # short-lived ones like Cloudflare's __cf_bm are always stale by
+                # the next run.
+                return None
+            clean["expiry"] = expiry
+
+    # SameSite=None is only legal alongside Secure; Firefox raises
+    # UnableToSetCookieException otherwise. Humble's analytics cookies are all
+    # stored this way. Drop the attribute and let the browser default apply.
+    if str(clean.get("sameSite", "")).lower() == "none" and not clean.get("secure"):
+        clean.pop("sameSite", None)
+
+    return clean
+
+
+def saved_auth_cookie_state(cookie_file):
+    """Report on the stored Humble auth cookie: (present, seconds_remaining)."""
+    try:
+        with open(cookie_file, "rb") as f:
+            cookies = pickle.load(f)
+    except Exception:
+        return False, 0
+    for cookie in cookies if isinstance(cookies, list) else []:
+        if isinstance(cookie, dict) and cookie.get("name") == HUMBLE_AUTH_COOKIE:
+            expiry = cookie.get("expiry")
+            if expiry is None:
+                return True, 0  # session cookie, no stated lifetime
+            try:
+                return True, int(expiry) - int(time.time())
+            except (TypeError, ValueError):
+                return True, 0
+    return False, 0
+
+
 def try_recover_cookies(cookie_file, session):
     try:
         with open(cookie_file, "rb") as f:
             cookies = pickle.load(f)
-        if type(session) is requests.Session:
-            # handle Steam session
-            session.cookies.update(cookies)
-        else:
-            # handle WebDriver
-            for cookie in cookies:
-                session.add_cookie(cookie)
-        return True
     except Exception:
         return False
+
+    if type(session) is requests.Session:
+        # handle Steam session
+        try:
+            session.cookies.update(cookies)
+            return True
+        except Exception:
+            return False
+
+    # handle WebDriver -- one cookie at a time, so a rejection costs only that
+    # cookie rather than the session it came with.
+    restored, rejected, skipped = 0, 0, 0
+    for cookie in cookies if isinstance(cookies, list) else []:
+        clean = sanitize_cookie(cookie)
+        if clean is None:
+            skipped += 1
+            continue
+        try:
+            session.add_cookie(clean)
+            restored += 1
+        except Exception as e:
+            rejected += 1
+            log(f"cookie {clean.get('name')!r} rejected: {type(e).__name__}")
+
+    log(
+        f"{cookie_file}: restored {restored}, rejected {rejected}, "
+        f"skipped {skipped} (expired or unusable)"
+    )
+    return restored > 0
 
 
 def export_cookies(cookie_file, session):
@@ -394,9 +485,28 @@ def do_login(driver,payload):
 def humble_login(driver):
     cls()
     driver.get(HUMBLE_LOGIN_PAGE)
-    # Attempt to use saved session
-    if try_recover_cookies(".humblecookies", driver) and verify_logins_session(driver)[0]:
-        return True
+
+    # Attempt to use saved session. Humble's auth cookie lasts 90 days, so this
+    # should normally succeed and no credentials are needed.
+    has_auth, remaining = saved_auth_cookie_state(".humblecookies")
+    if has_auth and remaining < 0:
+        print(f"Saved Humble session expired {abs(remaining) // 86400} days ago.")
+        log("humble: stored auth cookie already expired")
+    elif try_recover_cookies(".humblecookies", driver):
+        # Load a page that requires a session, so the restored cookies are
+        # actually applied before asking whether we are signed in.
+        driver.get(HUMBLE_KEYS_PAGE)
+        if verify_logins_session(driver)[0]:
+            days = remaining // 86400 if remaining > 0 else None
+            print("Reusing the saved Humble session"
+                  + (f" (valid for another {days} days)." if days else "."))
+            log("humble: saved session accepted")
+            # Re-save so a rotated or extended cookie is kept for next time.
+            export_cookies(".humblecookies", driver)
+            return True
+        print("The saved Humble session was rejected; signing in again.")
+        log("humble: saved session rejected by Humble")
+        driver.get(HUMBLE_LOGIN_PAGE)
 
     # Saved session didn't work
     while True:

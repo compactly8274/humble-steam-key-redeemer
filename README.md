@@ -33,13 +33,14 @@ Requires Python version 3.6 or above
 - `requests`: [requests](https://requests.readthedocs.io/en/master/)
 - `selenium`: [selenium](https://www.selenium.dev/)
 - `pwinput`: [pwinput](https://github.com/asweigart/pwinput)
-- `python-Levenshtein`: [ztane/python-Levenshtein](https://github.com/ztane/python-Levenshtein) **OPTIONAL**  
+- `python-Levenshtein`: [rapidfuzz/python-Levenshtein](https://github.com/rapidfuzz/python-Levenshtein)  
 
 Install the required dependencies with
 ```
 pip install -r requirements.txt
 ```
-If you want to install `python-Levenshtein`:
-```
-pip install python-Levenshtein
-```
+
+`python-Levenshtein` backs `fuzzywuzzy` with a C implementation. It used to be
+optional, but matching every Humble key against a large Steam library is slow
+enough on the pure-python fallback to be worth requiring. It installs from a
+prebuilt wheel, so no compiler is needed.

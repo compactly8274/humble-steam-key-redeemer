@@ -4,6 +4,7 @@ from selenium.common.exceptions import WebDriverException
 from fuzzywuzzy import fuzz
 import steam.webauth as wa
 from steam.enums import EResult
+import csv
 import time
 import pickle
 from pwinput import pwinput
@@ -13,7 +14,6 @@ import re
 import sys
 import unicodedata
 import webbrowser
-import os
 from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor
 import atexit
@@ -93,8 +93,24 @@ def send_api_request(data, steam_api_interface, steam_api_method, steam_api_vers
 
 wa.WebAuth.send_api_request = staticmethod(send_api_request)
 
-if __name__ == "__main__":
-    sys.stderr = open('error.log','a')
+ERROR_LOG_FILE = "error.log"
+_output_files = {}
+
+
+def _open_output_file(filename):
+    if filename not in _output_files:
+        _output_files[filename] = open(filename, "a", encoding="utf-8-sig")
+    return _output_files[filename]
+
+
+def close_output_files():
+    for f in _output_files.values():
+        try:
+            f.close()
+        except Exception:
+            pass
+    _output_files.clear()
+
 
 # Humble endpoints
 HUMBLE_LOGIN_PAGE = "https://www.humblebundle.com/login"
@@ -288,7 +304,8 @@ def valid_steam_key(key):
 
 def try_recover_cookies(cookie_file, session):
     try:
-        cookies = pickle.load(open(cookie_file,"rb"))
+        with open(cookie_file, "rb") as f:
+            cookies = pickle.load(f)
         if type(session) is requests.Session:
             # handle Steam session
             session.cookies.update(cookies)
@@ -297,22 +314,22 @@ def try_recover_cookies(cookie_file, session):
             for cookie in cookies:
                 session.add_cookie(cookie)
         return True
-    except Exception as e:
+    except Exception:
         return False
 
 
 def export_cookies(cookie_file, session):
     try:
-        cookies = None
         if type(session) is requests.Session:
             # handle Steam session
             cookies = session.cookies
         else:
             # handle WebDriver
             cookies = session.get_cookies()
-        pickle.dump(cookies, open(cookie_file,"wb"))
+        with open(cookie_file, "wb") as f:
+            pickle.dump(cookies, f)
         return True
-    except:
+    except Exception:
         return False
 
 is_logged_in = '''
@@ -345,11 +362,9 @@ def humble_login(driver):
         return True
 
     # Saved session didn't work
-    authorized = False
-    while not authorized:
+    while True:
         username = input("Humble Email: ")
         password = pwinput()
-
 
         payload = {
             "access_token": "",
@@ -360,7 +375,7 @@ def humble_login(driver):
             "password": password,
         }
 
-        auth,login_json = do_login(driver,payload)
+        auth, login_json = do_login(driver, payload)
 
         if "errors" in login_json and "username" in login_json["errors"]:
             # Unknown email OR mismatched password
@@ -373,7 +388,7 @@ def humble_login(driver):
                 humble_guard_code = input("Please enter the Humble security code: ")
                 payload["guard"] = humble_guard_code.upper()
                 # Humble security codes are case-sensitive via API, but luckily it's all uppercase!
-                auth,login_json = do_login(driver,payload)
+                auth, login_json = do_login(driver, payload)
 
                 if (
                     "user_terms_opt_in_data" in login_json
@@ -383,21 +398,20 @@ def humble_login(driver):
                     print(
                         "There's been an update to the TOS, please sign in to Humble on your browser."
                     )
-                    sys.exit()
+                    sys.exit(1)
             elif (
                 "two_factor_required" in login_json and
-                "errors" in login_json
-                and "authy-input" in login_json["errors"]
+                "errors" in login_json and
+                "authy-input" in login_json["errors"]
             ):
                 code = input("Please enter 2FA code: ")
                 payload["code"] = code
-                auth,login_json = do_login(driver,payload)
+                auth, login_json = do_login(driver, payload)
             elif "errors" in login_json:
                 print("Unexpected login error detected.")
                 print(login_json["errors"])
-                raise Exception(login_json)
-                sys.exit()
-            
+                sys.exit(1)
+
             if auth == 200:
                 break
 
@@ -510,21 +524,30 @@ def _redeem_steam(session, key, quiet=False):
     # Based on https://gist.github.com/snipplets/2156576c2754f8a4c9b43ccb674d5a5d
     if key == "":
         return 0
-    session_id = session.cookies.get_dict()["sessionid"]
-    r = session.post(STEAM_REDEEM_API, data={"product_key": key, "sessionid": session_id})
-    blob = r.json()
+    cookies = session.cookies.get_dict()
+    session_id = cookies.get("sessionid")
+    if not session_id:
+        print("Error: Steam sessionid cookie missing. Sign in again.")
+        return 53
+    try:
+        r = session.post(STEAM_REDEEM_API, data={"product_key": key, "sessionid": session_id})
+        blob = r.json()
+    except ValueError as e:
+        if not quiet:
+            print(f"Error: Steam activation returned a non-JSON response: {e}")
+        return 53
 
-    if blob["success"] == 1:
-        for item in blob["purchase_receipt_info"]["line_items"]:
-            print("Redeemed " + item["line_item_description"])
+    if blob.get("success") == 1:
+        for item in blob.get("purchase_receipt_info", {}).get("line_items", []):
+            print("Redeemed " + item.get("line_item_description", "the product"))
         return 0
     else:
         error_code = blob.get("purchase_result_details")
-        if error_code == None:
+        if error_code is None:
             # Sometimes purchase_result_details isn't there for some reason, try alt method
-            error_code = blob.get("purchase_receipt_info")
-            if error_code != None:
-                error_code = error_code.get("result_detail")
+            receipt = blob.get("purchase_receipt_info")
+            if receipt is not None:
+                error_code = receipt.get("result_detail")
         error_code = error_code or 53
 
         if error_code == 14:
@@ -597,13 +620,12 @@ def write_key(code, key):
         filename = "errored.csv"
 
     if filename not in files:
-        files[filename] = open(filename, "a", encoding="utf-8-sig")
-    key["human_name"] = key["human_name"].replace(",", ".")
-    gamekey = key.get('gamekey')
-    human_name = key.get("human_name")
+        files[filename] = open(filename, "a", encoding="utf-8-sig", newline="")
+    writer = csv.writer(files[filename])
+    gamekey = key.get("gamekey")
+    human_name = key.get("human_name", "")
     redeemed_key_val = key.get("redeemed_key_val")
-    output = f"{gamekey},{human_name},{redeemed_key_val}\n"
-    files[filename].write(output)
+    writer.writerow([gamekey, human_name, redeemed_key_val])
     files[filename].flush()
 
 
@@ -1119,17 +1141,12 @@ def export_mode(humble_session,order_details):
     
     ts = time.strftime("%Y%m%d-%H%M%S")
     filename = f"humble_export_{ts}.csv"
-    with open(filename, 'w', encoding="utf-8-sig") as f:
-        f.write(','.join(export_key_headers)+"\n")
+    with open(filename, 'w', encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=export_key_headers, extrasaction="ignore")
+        writer.writeheader()
         for key in keys:
-            row = []
-            for col in export_key_headers:
-                if col in key:
-                    row.append("\"" + str(key[col]) + "\"")
-                else:
-                    row.append("")
-            f.write(','.join(row)+"\n")
-    
+            writer.writerow({col: key.get(col, "") for col in export_key_headers})
+
     print(f"Exported to {filename}")
 
 
@@ -1145,7 +1162,7 @@ def choose_games(humble_session,choice_month_name,identifier,chosen):
                 "chosen_identifiers[]":display_name,
                 "is_multikey_and_from_choice_modal":"false"
             }
-            status,res = perform_post(driver,HUMBLE_CHOOSE_CONTENT,payload)
+            status,res = perform_post(humble_session,HUMBLE_CHOOSE_CONTENT,payload)
             if not ("success" in res or not res["success"]):
                 print("Error choosing " + choice["title"])
                 print(res)
@@ -1156,7 +1173,6 @@ def choose_games(humble_session,choice_month_name,identifier,chosen):
 def humble_chooser_mode(humble_session,order_details):
     try_redeem_keys = []
     months = get_choices(humble_session,order_details)
-    count = 0
     first = True
     for month in months:
         redeem_all = None
@@ -1262,8 +1278,10 @@ def cls():
 def print_main_header():
     print("-=FailSpy's Humble Bundle Helper!=-")
     print("--------------------------------------")
-    
-if __name__=="__main__":
+
+
+def main():
+    global INTERACTIVE_MATCHING
     INTERACTIVE_MATCHING = "--interactive" in sys.argv
     if INTERACTIVE_MATCHING:
         print("Interactive matching on: you'll be asked about ambiguous titles.")
@@ -1280,10 +1298,10 @@ if __name__=="__main__":
     desired_mode = prompt_mode(order_details,driver)
     if(desired_mode == "2"):
         export_mode(driver,order_details)
-        sys.exit()
+        return
     if(desired_mode == "3"):
         humble_chooser_mode(driver,order_details)
-        sys.exit()
+        return
 
     # Auto-Redeem mode
     cls()
@@ -1295,10 +1313,11 @@ if __name__=="__main__":
     original_length = len(steam_keys)
     for filter_file in filters:
         try:
-            with open(filter_file, "r") as f:
-                keycols = f.read()
-            filtered_keys = [keycol.strip() for keycol in keycols.replace("\n", ",").split(",")]
-            steam_keys = [key for key in steam_keys if key.get("redeemed_key_val",False) not in filtered_keys]
+            with open(filter_file, "r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.reader(f)
+                next(reader, None)  # skip header if present
+                seen = set(row[0].strip() for row in reader if row)
+            steam_keys = [key for key in steam_keys if key.get("gamekey") not in seen]
         except FileNotFoundError:
             pass
     if len(steam_keys) != original_length:
@@ -1326,5 +1345,17 @@ if __name__=="__main__":
         redeem_steam_keys(driver, revealed_keys)
 
     # Cleanup
-    for f in files:
-        files[f].close()
+    close_output_files()
+
+
+if __name__=="__main__":
+    sys.stderr = open(ERROR_LOG_FILE, 'a')
+    try:
+        main()
+    finally:
+        close_output_files()
+        if sys.stderr is not None and sys.stderr != sys.__stderr__:
+            try:
+                sys.stderr.close()
+            except Exception:
+                pass

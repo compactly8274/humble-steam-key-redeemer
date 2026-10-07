@@ -9,7 +9,9 @@ import pickle
 from pwinput import pwinput
 import os
 import json
+import re
 import sys
+import unicodedata
 import webbrowser
 import os
 from base64 import b64encode
@@ -121,6 +123,10 @@ STEAM_APP_SEARCH_API = "https://steamcommunity.com/actions/SearchApps/"
 STEAM_API_KEY_FILE = "steam_api_key.txt"
 
 # May actually be able to do without these, but for now they're in.
+# Per-game ownership prompts, restored with --interactive. Off by default: with
+# the matching below, the prompt only ever fired on wrong candidates.
+INTERACTIVE_MATCHING = False
+
 headers = {
     "Content-Type": "application/x-www-form-urlencoded",
     "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -732,7 +738,7 @@ def search_owned_candidates(steam_session, game_name, owned_app_ids, cache):
     """Key-less ownership lookup: ask Steam's search for this title, keep what we own.
 
     Returns appid -> name for matching apps the user already owns, in the same shape
-    the full catalogue would have given, so match_ownership works unchanged.
+    the full catalogue would have given, so classify_ownership works unchanged.
     """
     term = game_name.strip()
     if term in cache:
@@ -803,50 +809,137 @@ def get_owned_apps(steam_session):
 
     return owned_app_ids, owned_app_details
 
-def match_ownership(owned_app_details, game, filter_live):
-    threshold = 70
-    best_match = (0, None)
-    # Do a string search based on product names.
-    matches = [
-        (fuzz.token_set_ratio(appname, game["human_name"]), appid)
-        for appid, appname in owned_app_details.items()
-    ]
-    refined_matches = [
-        (fuzz.token_sort_ratio(owned_app_details[appid], game["human_name"]), appid)
-        for score, appid in matches
-        if score > threshold
-    ]
-    
-    if filter_live and len(refined_matches) > 0:
-        cls()
-        best_match = max(refined_matches, key=lambda item: item[0])
-        if best_match[0] == 100:
-            return best_match
-        print("steam games you own")
-        for match in refined_matches:
-            print(f"     {owned_app_details[match[1]]}: {match[0]}")
-        if prompt_yes_no(f"Is \"{game['human_name']}\" in the above list?"):
-            return refined_matches[0]
-        else:
-            return (0,None)
-    else:
-        if len(refined_matches) > 0:
-            best_match = max(refined_matches, key=lambda item: item[0])
-        elif len(refined_matches) == 1:
-            best_match = refined_matches[0]
-        if best_match[0] < 35:
-            best_match = (0,None)
-    return best_match
+# Ownership verdicts. Precision matters more than recall here: a false "owned"
+# silently drops a key the user does not have, while a false "not owned" costs one
+# attempt against Steam's ~10-failures-per-hour limit and is recorded in
+# already_owned.csv so later runs skip it.
+OWNED = "owned"
+UNCERTAIN = "uncertain"
+NOT_OWNED = "not-owned"
 
-def prompt_filter_live():
-    mode = None
-    while mode not in ["y","n"]:
-        mode = input("You can either see a list of games we think you already own later in a file, or filter them now. Would you like to see them now? [y/n] ").strip()
-        if mode in ["y","n"]:
-            return mode
-        else:
-            print("Enter y or n")
-    return mode
+AUTO_OWNED_SCORE = 95
+NEAR_MISS_SCORE = 80
+OWNERSHIP_REPORT = "ownership_report.csv"
+
+# Qualifiers that denote the same game repackaged, so owning either side counts.
+EDITION_QUALIFIERS = (
+    "game of the year edition", "game of the year", "goty edition", "goty",
+    "complete edition", "complete pack", "definitive edition", "deluxe edition",
+    "enhanced edition", "ultimate edition", "gold edition", "premium edition",
+    "special edition", "anniversary edition", "remastered edition", "remastered",
+    "redux", "directors cut", "the final cut", "legendary edition",
+)
+
+# Sequels are routinely written as roman numerals on one store and digits on the
+# other. "i" is left out deliberately -- it collides with the pronoun.
+ROMAN_NUMERALS = {
+    "ii": "2", "iii": "3", "iv": "4", "v": "5", "vi": "6", "vii": "7",
+    "viii": "8", "ix": "9", "x": "10", "xi": "11", "xii": "12", "xiii": "13",
+}
+
+
+def normalize_title(title):
+    """Reduce a store title to a comparable form, keeping what distinguishes games."""
+    if not title:
+        return ""
+    text = str(title)
+    # Strip trademark glyphs before NFKD, which would expand U+2122 into "TM".
+    text = re.sub(r"[™®©]", " ", text)
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = text.lower()
+    text = re.sub(r"\((?:[^)]*\b(?:steam|pc|key)\b[^)]*)\)", " ", text)
+    text = text.replace("&", " and ")
+    text = re.sub(r"[‐-―]", " ", text)
+    text = re.sub(r"[^\w\s]", " ", text)
+    return " ".join(ROMAN_NUMERALS.get(t, t) for t in text.split()).strip()
+
+
+def series_numbers(normalized):
+    """Numeric tokens in order: 'portal' -> [], 'portal 2' -> ['2']."""
+    return [token for token in normalized.split() if token.isdigit()]
+
+
+def same_game(a, b):
+    """True when two normalized titles name the same product."""
+    if a == b:
+        return True
+    # One side carries an edition qualifier the other lacks.
+    for qualifier in EDITION_QUALIFIERS:
+        suffix = normalize_title(qualifier)
+        if a == f"{b} {suffix}" or b == f"{a} {suffix}":
+            return True
+    return False
+
+
+def classify_ownership(owned_app_details, game, interactive=False):
+    """Decide whether the user already owns this Humble title.
+
+    Returns (verdict, confidence, appid).
+
+    The old implementation scored candidates with fuzz.token_set_ratio, which
+    returns 100 whenever one title merely contains the other. Every sequel,
+    expansion and edition therefore looked like a match: "Arma 2" scored 100
+    against "Arma 2: Operation Arrowhead", so the run stopped to ask about each
+    one, and in non-interactive mode a score of 38 still counted as owned.
+    """
+    humble_norm = normalize_title(game.get("human_name"))
+    if not humble_norm or not owned_app_details:
+        return NOT_OWNED, 0, None
+
+    near_misses = []
+    for appid, appname in owned_app_details.items():
+        owned_norm = normalize_title(appname)
+        if not owned_norm:
+            continue
+        if same_game(humble_norm, owned_norm):
+            return OWNED, 100, appid
+        # A differing set of numbers means a different entry in the series. Without
+        # this, "Portal" vs "Portal 2" scores 86 and "Dishonored" vs "Dishonored 2"
+        # scores 91 -- indistinguishable from a real match by ratio alone.
+        if series_numbers(humble_norm) != series_numbers(owned_norm):
+            continue
+        score = fuzz.token_sort_ratio(owned_norm, humble_norm)
+        if score >= NEAR_MISS_SCORE:
+            near_misses.append((score, appid))
+
+    if not near_misses:
+        return NOT_OWNED, 0, None
+
+    score, appid = max(near_misses, key=lambda match: match[0])
+    if score >= AUTO_OWNED_SCORE:
+        return OWNED, score, appid
+
+    if interactive:
+        cls()
+        print(f'Humble key: "{game["human_name"]}"')
+        print("Similar games you already own on Steam:")
+        for near_score, near_appid in sorted(near_misses, reverse=True):
+            print(f"     {owned_app_details[near_appid]}: {near_score}")
+        if prompt_yes_no("Do you already own this game?"):
+            return OWNED, score, appid
+        return NOT_OWNED, score, None
+
+    return UNCERTAIN, score, appid
+
+
+def write_ownership_report(rows):
+    """Record every ownership decision, so skips can be reviewed after a run."""
+    try:
+        with open(OWNERSHIP_REPORT, "w", encoding="utf-8-sig") as f:
+            f.write("verdict,humble_name,matched_steam_name,appid,confidence\n")
+            for verdict, humble_name, steam_name, appid, score in rows:
+                cells = [
+                    verdict,
+                    str(humble_name).replace(",", "."),
+                    str(steam_name or "").replace(",", "."),
+                    str(appid if appid is not None else ""),
+                    str(score),
+                ]
+                f.write(",".join(cells) + "\n")
+    except OSError as e:
+        print(f"Warning: couldn't write {OWNERSHIP_REPORT}: {e}")
+
 
 def redeem_steam_keys(humble_session, humble_keys):
     session = steam_login()
@@ -860,11 +953,11 @@ def redeem_steam_keys(humble_session, humble_keys):
     noted_keys = [key for key in humble_keys if key["steam_app_id"] not in owned_app_ids]
     skipped_games = {}
     unownedgames = []
+    report_rows = []
+    uncertain_count = 0
 
     # Some Steam keys come back with no Steam AppID from Humble
     # So we do our best to look up from AppIDs (no packages, because can't find an API for it)
-
-    filter_live = prompt_filter_live() == "y"
 
     search_cache = {}
     for game in noted_keys:
@@ -876,21 +969,41 @@ def redeem_steam_keys(humble_session, humble_keys):
         else:
             candidates = owned_app_details
 
-        best_match = match_ownership(candidates,game,filter_live)
-        if best_match[1] is not None and best_match[1] in candidates:
+        verdict, score, appid = classify_ownership(candidates, game, INTERACTIVE_MATCHING)
+        matched_name = candidates.get(appid) if appid is not None else None
+        report_rows.append((verdict, game["human_name"], matched_name, appid, score))
+
+        if verdict == OWNED and appid is not None:
             skipped_games[game["human_name"].strip()] = game
         else:
+            # Uncertain titles are attempted: Steam is the authoritative check, and it
+            # reports "already owned" into already_owned.csv for later runs to filter.
+            if verdict == UNCERTAIN:
+                uncertain_count += 1
             unownedgames.append(game)
+
+    write_ownership_report(report_rows)
 
     print(
         "Filtered out game keys that you already own on Steam; {} keys unowned.".format(
             len(unownedgames)
         )
     )
+    if uncertain_count:
+        print(
+            f"{uncertain_count} were close matches that could not be decided from the "
+            f"title alone; attempting them. See {OWNERSHIP_REPORT}."
+        )
 
     if len(skipped_games):
-        # Skipped games uncertain to be owned by user. Let user choose
-        unownedgames = unownedgames + prompt_skipped(skipped_games)
+        if INTERACTIVE_MATCHING:
+            # Skipped games uncertain to be owned by user. Let user choose
+            unownedgames = unownedgames + prompt_skipped(skipped_games)
+        else:
+            print(
+                f"Skipped {len(skipped_games)} keys matched to games you already own "
+                f"(listed as '{OWNED}' in {OWNERSHIP_REPORT})."
+            )
         print("{} keys will be attempted.".format(len(unownedgames)))
         # Preserve original order
         unownedgames = sorted(unownedgames,key=lambda g: humble_keys.index(g))
@@ -953,7 +1066,8 @@ def export_mode(humble_session,order_details):
     reveal_unrevealed = False
     confirm_reveal = False
 
-    owned_app_details = None
+    owned_app_ids = None
+    owned_app_details = {}
 
     keys = []
     
@@ -974,7 +1088,11 @@ def export_mode(humble_session,order_details):
     if(steam_config):
         steam_session = steam_login()
         if(verify_logins_session(steam_session)[1]):
-            owned_app_details = get_owned_apps(steam_session)
+            owned_app_ids, owned_app_details = get_owned_apps(steam_session)
+            if owned_app_details is None:
+                # No Web API key, so there is no catalogue to match names against.
+                # Ownership is still exact on the app IDs Humble supplies.
+                owned_app_details = {}
     
     desired_keys = "steam_app_id" if export_steam_only else "key_type_human_name"
     keylist = list(find_dict_keys(order_details,desired_keys,True))
@@ -988,13 +1106,13 @@ def export_mode(humble_session,order_details):
                 # Redeem key if user requests all keys to be revealed
                 tpk["redeemed_key_val"] = redeem_humble_key(humble_session,tpk)
             
-            if(owned_app_details != None and "steam_app_id" in tpk):
+            if(owned_app_ids != None and "steam_app_id" in tpk):
                 # User requested Steam Ownership info
-                owned = tpk["steam_app_id"] in owned_app_details.keys()
+                owned = tpk["steam_app_id"] in owned_app_ids
                 if(not owned):
                     # Do a search to see if user owns it
-                    best_match = match_ownership(owned_app_details,tpk,False)
-                    owned = best_match[1] is not None and best_match[1] in owned_app_details.keys()
+                    verdict, _score, _appid = classify_ownership(owned_app_details, tpk)
+                    owned = verdict == OWNED
                 tpk["steam_ownership"] = owned
             
             keys.append(tpk)
@@ -1146,6 +1264,10 @@ def print_main_header():
     print("--------------------------------------")
     
 if __name__=="__main__":
+    INTERACTIVE_MATCHING = "--interactive" in sys.argv
+    if INTERACTIVE_MATCHING:
+        print("Interactive matching on: you'll be asked about ambiguous titles.")
+
     # Create a consistent session for Humble API use
     driver = get_headless_driver()
     humble_login(driver)

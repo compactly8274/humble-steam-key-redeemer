@@ -474,7 +474,7 @@ def redeem_humble_key(sess, tpk):
     status,respjson = perform_post(sess, HUMBLE_REDEEM_API, payload)
     
     if status != 200 or "error_msg" in respjson or not respjson["success"]:
-        print("Error redeeming key on Humble for " + tpk["human_name"])
+        print("Error redeeming key on Humble for " + key_title(tpk))
         if("error_msg" in respjson):
             print(respjson["error_msg"])
         return ""
@@ -648,7 +648,7 @@ def write_key(code, key):
     handle = _open_output_file(filename, newline="")
     writer = csv.writer(handle)
     gamekey = key.get("gamekey")
-    human_name = key.get("human_name", "")
+    human_name = key_title(key)
     redeemed_key_val = key.get("redeemed_key_val")
     writer.writerow([gamekey, human_name, redeemed_key_val])
     handle.flush()
@@ -922,12 +922,42 @@ EDITION_QUALIFIERS = (
     "redux", "directors cut", "the final cut", "legendary edition",
 )
 
+# Normalised once at import rather than per comparison.
+EDITION_QUALIFIER_NORMS = tuple(
+    " ".join(q.lower().replace("'", "").split()) for q in EDITION_QUALIFIERS
+)
+
 # Sequels are routinely written as roman numerals on one store and digits on the
 # other. "i" is left out deliberately -- it collides with the pronoun.
 ROMAN_NUMERALS = {
     "ii": "2", "iii": "3", "iv": "4", "v": "5", "vi": "6", "vii": "7",
     "viii": "8", "ix": "9", "x": "10", "xi": "11", "xii": "12", "xiii": "13",
 }
+
+
+def key_title(key):
+    """Display name for a Humble entry.
+
+    Entries found under "steam_app_id" do not all carry a "human_name" -- one
+    without it raised KeyError partway through a 1900-key run -- so fall back
+    through the other names Humble uses before giving up.
+    """
+    human_name = key.get("human_name")
+    if human_name:
+        return str(human_name)
+
+    # The remaining fields are slugs, and Humble suffixes Steam ones with _steam
+    # ("stardew_valley_steam"); left in place it defeats the title comparison.
+    for field in ("machine_name", "display_item_machine_name"):
+        value = key.get(field)
+        if value:
+            slug = str(value)
+            if slug.endswith("_steam"):
+                slug = slug[: -len("_steam")]
+            return slug.replace("_", " ")
+    gamekey = key.get("gamekey")
+    appid = key.get("steam_app_id")
+    return f"<unnamed key gamekey={gamekey} steam_app_id={appid}>"
 
 
 def normalize_title(title):
@@ -952,44 +982,83 @@ def series_numbers(normalized):
     return [token for token in normalized.split() if token.isdigit()]
 
 
-def same_game(a, b):
-    """True when two normalized titles name the same product."""
-    if a == b:
-        return True
-    # One side carries an edition qualifier the other lacks.
-    for qualifier in EDITION_QUALIFIERS:
-        suffix = normalize_title(qualifier)
-        if a == f"{b} {suffix}" or b == f"{a} {suffix}":
-            return True
-    return False
+class OwnershipIndex:
+    """Owned titles, normalised once.
+
+    classify_ownership runs per Humble key. Normalising every owned title inside
+    that call meant thousands of redundant normalisations per key -- roughly
+    400ms per key against a 2500-game library, or 12 minutes over a full run.
+    Building this once drops exact matches to a dict lookup.
+    """
+
+    __slots__ = ("names", "by_norm", "entries")
+
+    def __init__(self, owned_app_details):
+        self.names = owned_app_details or {}
+        self.by_norm = {}
+        self.entries = []
+        for appid, appname in self.names.items():
+            norm = normalize_title(appname)
+            if not norm:
+                continue
+            self.by_norm.setdefault(norm, appid)
+            self.entries.append((norm, series_numbers(norm), len(norm), appid))
+
+    def __bool__(self):
+        return bool(self.entries)
 
 
-def classify_ownership(owned_app_details, game, interactive=False):
+def build_ownership_index(owned_app_details):
+    return OwnershipIndex(owned_app_details)
+
+
+def classify_ownership(index, game, interactive=False):
     """Decide whether the user already owns this Humble title.
 
     Returns (verdict, confidence, appid).
 
-    The old implementation scored candidates with fuzz.token_set_ratio, which
-    returns 100 whenever one title merely contains the other. Every sequel,
-    expansion and edition therefore looked like a match: "Arma 2" scored 100
-    against "Arma 2: Operation Arrowhead", so the run stopped to ask about each
-    one, and in non-interactive mode a score of 38 still counted as owned.
+    The original implementation scored candidates with fuzz.token_set_ratio,
+    which returns 100 whenever one title merely contains the other. Every
+    sequel, expansion and edition therefore looked like a match: "Arma 2" scored
+    100 against "Arma 2: Operation Arrowhead", so the run stopped to ask about
+    each one, and non-interactively a score of 38 still counted as owned.
     """
-    humble_norm = normalize_title(game.get("human_name"))
-    if not humble_norm or not owned_app_details:
+    if not isinstance(index, OwnershipIndex):
+        # Convenience for callers holding a plain appid -> name mapping.
+        index = OwnershipIndex(index)
+
+    humble_norm = normalize_title(key_title(game))
+    if not humble_norm or not index:
         return NOT_OWNED, 0, None
 
-    near_misses = []
-    for appid, appname in owned_app_details.items():
-        owned_norm = normalize_title(appname)
-        if not owned_norm:
-            continue
-        if same_game(humble_norm, owned_norm):
+    # Exact title, then the same title with an edition qualifier on either side.
+    # All dict lookups, so none of this touches the candidate list.
+    appid = index.by_norm.get(humble_norm)
+    if appid is not None:
+        return OWNED, 100, appid
+
+    for qualifier in EDITION_QUALIFIER_NORMS:
+        appid = index.by_norm.get(f"{humble_norm} {qualifier}")
+        if appid is not None:
             return OWNED, 100, appid
-        # A differing set of numbers means a different entry in the series. Without
-        # this, "Portal" vs "Portal 2" scores 86 and "Dishonored" vs "Dishonored 2"
-        # scores 91 -- indistinguishable from a real match by ratio alone.
-        if series_numbers(humble_norm) != series_numbers(owned_norm):
+        suffix = " " + qualifier
+        if humble_norm.endswith(suffix):
+            appid = index.by_norm.get(humble_norm[: -len(suffix)])
+            if appid is not None:
+                return OWNED, 100, appid
+
+    humble_nums = series_numbers(humble_norm)
+    humble_len = len(humble_norm)
+    near_misses = []
+    for owned_norm, owned_nums, owned_len, appid in index.entries:
+        # A differing set of numbers means a different entry in the series.
+        # Without this, "Portal" vs "Portal 2" scores 86 and "Dishonored" vs
+        # "Dishonored 2" scores 91 -- indistinguishable from a real match.
+        if owned_nums != humble_nums:
+            continue
+        # SequenceMatcher's ratio cannot exceed 2*min_len/(len_a+len_b), so skip
+        # pairs that could never reach the band instead of scoring them.
+        if 200 * min(humble_len, owned_len) < NEAR_MISS_SCORE * (humble_len + owned_len):
             continue
         score = fuzz.token_sort_ratio(owned_norm, humble_norm)
         if score >= NEAR_MISS_SCORE:
@@ -1004,10 +1073,10 @@ def classify_ownership(owned_app_details, game, interactive=False):
 
     if interactive:
         cls()
-        print(f'Humble key: "{game["human_name"]}"')
+        print(f'Humble key: "{key_title(game)}"')
         print("Similar games you already own on Steam:")
         for near_score, near_appid in sorted(near_misses, reverse=True):
-            print(f"     {owned_app_details[near_appid]}: {near_score}")
+            print(f"     {index.names.get(near_appid, near_appid)}: {near_score}")
         if prompt_yes_no("Do you already own this game?"):
             return OWNED, score, appid
         return NOT_OWNED, score, None
@@ -1052,21 +1121,30 @@ def redeem_steam_keys(humble_session, humble_keys):
     # So we do our best to look up from AppIDs (no packages, because can't find an API for it)
 
     search_cache = {}
+    # Normalising the catalogue once instead of per key: with a 2500-game library
+    # the per-key version cost ~400ms each, about 12 minutes over a full run.
+    catalog_index = (
+        build_ownership_index(owned_app_details) if owned_app_details is not None else None
+    )
+
     for game in noted_keys:
+        title = key_title(game)
         if owned_app_details is None:
             # No API key: look this one title up instead of scanning a full catalogue.
             candidates = search_owned_candidates(
-                session, game["human_name"], owned_app_ids, search_cache
+                session, title, owned_app_ids, search_cache
             )
+            index = build_ownership_index(candidates)
         else:
             candidates = owned_app_details
+            index = catalog_index
 
-        verdict, score, appid = classify_ownership(candidates, game, INTERACTIVE_MATCHING)
+        verdict, score, appid = classify_ownership(index, game, INTERACTIVE_MATCHING)
         matched_name = candidates.get(appid) if appid is not None else None
-        report_rows.append((verdict, game["human_name"], matched_name, appid, score))
+        report_rows.append((verdict, title, matched_name, appid, score))
 
         if verdict == OWNED and appid is not None:
-            skipped_games[game["human_name"].strip()] = game
+            skipped_games[title.strip()] = game
         else:
             # Uncertain titles are attempted: Steam is the authoritative check, and it
             # reports "already owned" into already_owned.csv for later runs to filter.
@@ -1108,16 +1186,17 @@ def redeem_steam_keys(humble_session, humble_keys):
     redeemed = []
 
     for key in unownedgames:
-        print(key["human_name"])
+        title = key_title(key)
+        print(title)
 
-        if key["human_name"] in redeemed or (key["steam_app_id"] != None and key["steam_app_id"] in redeemed):
+        if title in redeemed or (key["steam_app_id"] != None and key["steam_app_id"] in redeemed):
             # We've bumped into a repeat of the same game!
             write_key(9,key)
             continue
         else:
             if key["steam_app_id"] != None:
                 redeemed.append(key["steam_app_id"])
-            redeemed.append(key["human_name"])
+            redeemed.append(title)
 
         if "redeemed_key_val" not in key:
             # This key is unredeemed via Humble, trigger redemption process.
@@ -1191,6 +1270,8 @@ def export_mode(humble_session,order_details):
                 # Ownership is still exact on the app IDs Humble supplies.
                 owned_app_details = {}
     
+    export_index = build_ownership_index(owned_app_details)
+
     desired_keys = "steam_app_id" if export_steam_only else "key_type_human_name"
     keylist = list(find_dict_keys(order_details,desired_keys,True))
 
@@ -1208,7 +1289,7 @@ def export_mode(humble_session,order_details):
                 owned = tpk["steam_app_id"] in owned_app_ids
                 if(not owned):
                     # Do a search to see if user owns it
-                    verdict, _score, _appid = classify_ownership(owned_app_details, tpk)
+                    verdict, _score, _appid = classify_ownership(export_index, tpk)
                     owned = verdict == OWNED
                 tpk["steam_ownership"] = owned
             

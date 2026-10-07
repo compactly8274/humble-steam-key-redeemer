@@ -1,4 +1,5 @@
 fuzzywuzzy>=0.17.0
+python-Levenshtein>=0.25.0 # C-backed matching for fuzzywuzzy; without it fuzzywuzzy falls back to pure-python SequenceMatcher and warns
 requests>=2.25.1
 selenium>=4.10.0
 pwinput>=1.0.3

@@ -99,6 +99,15 @@ ERROR_LOG_FILE = "error.log"
 APPDETAILS_MAX_LOOKUPS = 50
 APPDETAILS_DELAY = 0.3
 
+# ICommunityService/GetApps takes app ids in bulk. 400 per request overruns
+# the URI length limit (HTTP 414); 200 is comfortably under it.
+GETAPPS_BATCH = 200
+GETAPPS_DELAY = 0.3
+
+# Steam counts an already-owned key as a failed activation and allows only
+# ~10 failures an hour, so attempts are spaced rather than fired back to back.
+REDEEM_DELAY = 3
+
 # Set in __main__. None while the module is merely imported, so log() stays quiet
 # for anything that pulls these helpers in without wanting a log file.
 LOG_STREAM = None
@@ -163,6 +172,7 @@ STEAM_REDEEM_API = "https://store.steampowered.com/account/ajaxregisterkey/"
 STEAM_APP_LIST_API = "https://api.steampowered.com/IStoreService/GetAppList/v1/"
 STEAM_APP_DETAILS_API = "https://store.steampowered.com/api/appdetails"
 STEAM_APP_SEARCH_API = "https://steamcommunity.com/actions/SearchApps/"
+STEAM_GETAPPS_API = "https://api.steampowered.com/ICommunityService/GetApps/v1/"
 STEAM_API_KEY_FILE = "steam_api_key.txt"
 
 # May actually be able to do without these, but for now they're in.
@@ -650,7 +660,9 @@ def write_key(code, key):
     gamekey = key.get("gamekey")
     human_name = key_title(key)
     redeemed_key_val = key.get("redeemed_key_val")
-    writer.writerow([gamekey, human_name, redeemed_key_val])
+    # keyindex identifies one game within its order; a gamekey covers the whole
+    # order. Appended last so files from earlier versions still parse.
+    writer.writerow([gamekey, human_name, redeemed_key_val, key.get("keyindex")])
     handle.flush()
     log(f"key result: code={code} file={filename} name={human_name!r}")
 
@@ -760,6 +772,46 @@ def fetch_steam_catalog(steam_session, api_key):
     log(f"catalogue fetched: {len(catalog)} apps")
     return catalog
 
+
+def fetch_app_names_bulk(api_key, app_ids):
+    """Resolve app ids to names via ICommunityService/GetApps.
+
+    The catalogue endpoint omits store-delisted apps, which for a large library
+    is around a thousand of them. This one takes app ids directly and answers in
+    bulk, so the whole gap costs a handful of requests instead of one throttled
+    request per app.
+    """
+    names = {}
+    remaining = list(app_ids)
+    if not remaining or not api_key:
+        return names
+
+    print(f"Resolving {len(remaining)} app names Steam's catalogue omits...")
+    batches = range(0, len(remaining), GETAPPS_BATCH)
+    for start in batches:
+        batch = remaining[start:start + GETAPPS_BATCH]
+        params = {"key": api_key}
+        for i, appid in enumerate(batch):
+            params[f"appids[{i}]"] = appid
+
+        body = steam_json(
+            requests, STEAM_GETAPPS_API, "the Steam app-name lookup",
+            params=params, timeout=60,
+        )
+        if body is None:
+            log(f"GetApps: batch at {start} failed; keeping {len(names)} resolved so far")
+            break
+
+        for app in body.get("response", {}).get("apps", []) or []:
+            name = app.get("name")
+            appid = app.get("appid")
+            if name and appid is not None:
+                names[appid] = name
+
+        time.sleep(GETAPPS_DELAY)
+
+    log(f"GetApps: resolved {len(names)} of {len(app_ids)} missing names")
+    return names
 
 def fetch_app_names(steam_session, app_ids):
     """Best-effort names for owned apps the catalogue omits (store-delisted ones).
@@ -889,7 +941,14 @@ def get_owned_apps(steam_session):
 
     missing = [appid for appid in owned_app_ids if appid not in catalog]
     if missing:
-        owned_app_details.update(fetch_app_names(steam_session, missing))
+        # Bulk lookup by app id first; it covers delisted apps the catalogue
+        # drops and costs a handful of requests. Per-app appdetails is only a
+        # fallback for whatever that leaves behind.
+        resolved = fetch_app_names_bulk(api_key, missing)
+        owned_app_details.update(resolved)
+        still_missing = [appid for appid in missing if appid not in resolved]
+        if still_missing:
+            owned_app_details.update(fetch_app_names(steam_session, still_missing))
 
     unresolved = len(owned_app_ids) - len(owned_app_details)
     if unresolved:
@@ -920,7 +979,15 @@ EDITION_QUALIFIERS = (
     "enhanced edition", "ultimate edition", "gold edition", "premium edition",
     "special edition", "anniversary edition", "remastered edition", "remastered",
     "redux", "directors cut", "the final cut", "legendary edition",
+    # Seen as real misses against this library: Humble sells the edition, the
+    # Steam entry already owned is the plain title (or the reverse).
+    "collectors edition", "collector s edition", "masterpiece edition",
+    "royal edition", "complete story", "standard edition", "extended edition",
+    "digital deluxe edition", "digital deluxe", "collection", "anthology",
+    "full version", "the complete edition", "season pass edition", "bundle",
 )
+
+STOREFRONT_NOISE = frozenset({"steam", "key", "keys"})
 
 # Normalised once at import rather than per comparison.
 EDITION_QUALIFIER_NORMS = tuple(
@@ -974,12 +1041,53 @@ def normalize_title(title):
     text = text.replace("&", " and ")
     text = re.sub(r"[‐-―]", " ", text)
     text = re.sub(r"[^\w\s]", " ", text)
-    return " ".join(ROMAN_NUMERALS.get(t, t) for t in text.split()).strip()
+    tokens = [ROMAN_NUMERALS.get(t, t) for t in text.split()]
+
+    # Humble tacks the storefront onto many titles ("Bastion Steam Key",
+    # "Broken Sword: Director's Cut Steam key") where Steam's own name has no
+    # such suffix. Applied to both sides, so a game genuinely ending in one of
+    # these words still matches itself.
+    while tokens and tokens[-1] in STOREFRONT_NOISE:
+        tokens.pop()
+
+    return " ".join(tokens).strip()
 
 
-def series_numbers(normalized):
-    """Numeric tokens in order: 'portal' -> [], 'portal 2' -> ['2']."""
-    return [token for token in normalized.split() if token.isdigit()]
+def sequel_number(normalized):
+    """A trailing number, which is how sequels are marked: 'portal 2' -> '2'.
+
+    'blackwell 1 legacy' returns None -- the 1 there indexes a series whose
+    Steam titles ('The Blackwell Legacy') omit it entirely.
+    """
+    tokens = normalized.split()
+    if tokens and tokens[-1].isdigit():
+        return tokens[-1]
+    return None
+
+
+def sequel_mismatch(a, b):
+    """True when two titles are different entries in a series.
+
+    Ratios cannot see this: the difference is one short token, so "Portal" vs
+    "Portal 2" scores 86 and "Dishonored" vs "Dishonored 2" scores 91.
+
+    Only trailing numbers count, and only when they actually distinguish the
+    two titles. An earlier version compared every numeric token anywhere in the
+    string, which wrongly rejected "Blackwell 1: Legacy" against "The Blackwell
+    Legacy" and "Ticket to Ride 1910 USA DLC" against "Ticket to Ride: USA 1910".
+    """
+    tokens_a, tokens_b = a.split(), b.split()
+    num_a, num_b = sequel_number(a), sequel_number(b)
+
+    if num_a and num_b:
+        # "civilization 5" vs "civilization 6"
+        return num_a != num_b
+    # "portal 2" vs "portal": same title, one carries a sequel number.
+    if num_a and " ".join(tokens_a[:-1]) == b:
+        return True
+    if num_b and " ".join(tokens_b[:-1]) == a:
+        return True
+    return False
 
 
 class OwnershipIndex:
@@ -1002,7 +1110,7 @@ class OwnershipIndex:
             if not norm:
                 continue
             self.by_norm.setdefault(norm, appid)
-            self.entries.append((norm, series_numbers(norm), len(norm), appid))
+            self.entries.append((norm, len(norm), appid))
 
     def __bool__(self):
         return bool(self.entries)
@@ -1047,14 +1155,10 @@ def classify_ownership(index, game, interactive=False):
             if appid is not None:
                 return OWNED, 100, appid
 
-    humble_nums = series_numbers(humble_norm)
     humble_len = len(humble_norm)
     near_misses = []
-    for owned_norm, owned_nums, owned_len, appid in index.entries:
-        # A differing set of numbers means a different entry in the series.
-        # Without this, "Portal" vs "Portal 2" scores 86 and "Dishonored" vs
-        # "Dishonored 2" scores 91 -- indistinguishable from a real match.
-        if owned_nums != humble_nums:
+    for owned_norm, owned_len, appid in index.entries:
+        if sequel_mismatch(humble_norm, owned_norm):
             continue
         # SequenceMatcher's ratio cannot exceed 2*min_len/(len_a+len_b), so skip
         # pairs that could never reach the band instead of scoring them.
@@ -1115,7 +1219,7 @@ def redeem_steam_keys(humble_session, humble_keys):
     skipped_games = {}
     unownedgames = []
     report_rows = []
-    uncertain_count = 0
+    uncertain_games = []
 
     # Some Steam keys come back with no Steam AppID from Humble
     # So we do our best to look up from AppIDs (no packages, because can't find an API for it)
@@ -1149,13 +1253,13 @@ def redeem_steam_keys(humble_session, humble_keys):
             # Uncertain titles are attempted: Steam is the authoritative check, and it
             # reports "already owned" into already_owned.csv for later runs to filter.
             if verdict == UNCERTAIN:
-                uncertain_count += 1
+                uncertain_games.append(game)
             unownedgames.append(game)
 
     write_ownership_report(report_rows)
     log(
         f"ownership decisions: {len(skipped_games)} owned (skipped), "
-        f"{uncertain_count} uncertain (attempted), "
+        f"{len(uncertain_games)} uncertain (attempted), "
         f"{len(unownedgames)} to attempt of {len(noted_keys)} considered"
     )
 
@@ -1164,9 +1268,9 @@ def redeem_steam_keys(humble_session, humble_keys):
             len(unownedgames)
         )
     )
-    if uncertain_count:
+    if uncertain_games:
         print(
-            f"{uncertain_count} were close matches that could not be decided from the "
+            f"{len(uncertain_games)} were close matches that could not be decided from the "
             f"title alone; attempting them. See {OWNERSHIP_REPORT}."
         )
 
@@ -1180,10 +1284,20 @@ def redeem_steam_keys(humble_session, humble_keys):
                 f"(listed as '{OWNED}' in {OWNERSHIP_REPORT})."
             )
         print("{} keys will be attempted.".format(len(unownedgames)))
-        # Preserve original order
-        unownedgames = sorted(unownedgames,key=lambda g: humble_keys.index(g))
-    
+
+    # Confident non-matches first, close matches last. Steam treats an
+    # already-owned key as a failed activation and allows only ~10 failures an
+    # hour, so the quota should go to the keys most likely to actually redeem --
+    # and a run stopped part way through will have spent it on those.
+    uncertain_ids = {id(game) for game in uncertain_games}
+    unownedgames = sorted(
+        unownedgames,
+        key=lambda g: (id(g) in uncertain_ids, humble_keys.index(g)),
+    )
+
+
     redeemed = []
+    attempted_any = False
 
     for key in unownedgames:
         title = key_title(key)
@@ -1208,6 +1322,13 @@ def redeem_steam_keys(humble_session, humble_keys):
             # Most likely humble gift link
             write_key(1, key)
             continue
+
+        if attempted_any:
+            # Spacing attempts does not raise Steam's hourly quota, but it does
+            # avoid the harsher "too many recent activation attempts" lockout
+            # that back-to-back requests trigger.
+            time.sleep(REDEEM_DELAY)
+        attempted_any = True
 
         code = _redeem_steam(session, key["redeemed_key_val"])
         animation = "|/-\\"
@@ -1465,17 +1586,37 @@ def main():
     revealed_keys = []
     steam_keys = list(find_dict_keys(order_details,"steam_app_id",True))
 
+    # A gamekey is a whole Humble order and keyindex picks one game out of it, so
+    # these files are matched per entry. Filtering on gamekey alone discarded every
+    # other game in any order that had a single result recorded -- with bundle
+    # orders holding dozens of games, that quietly hid hundreds of keys.
     filters = ["errored.csv", "already_owned.csv", "redeemed.csv"]
     original_length = len(steam_keys)
+    seen_key_values = set()
+    seen_entries = set()
     for filter_file in filters:
         try:
             with open(filter_file, "r", encoding="utf-8-sig", newline="") as f:
-                reader = csv.reader(f)
-                next(reader, None)  # skip header if present
-                seen = set(row[0].strip() for row in reader if row)
-            steam_keys = [key for key in steam_keys if key.get("gamekey") not in seen]
+                for row in csv.reader(f):
+                    if not row or row[0].strip() == "gamekey":
+                        continue
+                    if len(row) > 2 and row[2].strip():
+                        seen_key_values.add(row[2].strip())
+                    if len(row) > 3 and row[3].strip():
+                        seen_entries.add((row[0].strip(), row[3].strip()))
         except FileNotFoundError:
             pass
+
+    def already_handled(key):
+        value = key.get("redeemed_key_val")
+        if value and value in seen_key_values:
+            return True
+        keyindex = key.get("keyindex")
+        if keyindex is not None:
+            return (str(key.get("gamekey")), str(keyindex)) in seen_entries
+        return False
+
+    steam_keys = [key for key in steam_keys if not already_handled(key)]
     if len(steam_keys) != original_length:
         print("Filtered {} keys from previous runs".format(original_length - len(steam_keys)))
 

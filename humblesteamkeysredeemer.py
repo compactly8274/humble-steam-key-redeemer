@@ -958,6 +958,12 @@ def fetch_owned_via_webapi(api_key, steamid):
         "steamid": steamid,
         "include_appinfo": 1,
         "include_played_free_games": 1,
+        # v1 omits apps Steam considers "unvetted" unless this is false
+        # (verified in the field: owned games missing from the default
+        # response, present with it). The session path sees those apps, so
+        # the key-only path must too -- otherwise owned keys would read as
+        # not-owned and be attempted against the ~10/hr failure quota.
+        "skip_unvetted_apps": "false",
     }
     body = steam_json(
         requests, STEAM_OWNEDGAMES_API, "your owned games (Web API)",

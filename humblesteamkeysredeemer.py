@@ -13,6 +13,7 @@ import json
 import re
 import sys
 import traceback
+import html
 import unicodedata
 import webbrowser
 from base64 import b64encode
@@ -1109,7 +1110,81 @@ def search_owned_candidates(steam_session, game_name, owned_app_ids, cache):
     return candidates
 
 
-def get_owned_apps(steam_session):
+def build_humble_name_map(humble_keys):
+    """appid -> name straight from Humble's own order data.
+
+    Steam's catalogue and ICommunityService/GetApps both drop store-delisted
+    apps, and store/api/appdetails answers success:false for them (verified
+    live), so some owned apps are otherwise nameless. Humble still knows what
+    the user bought them as. Exact app-id matching was never affected (the ids
+    sit in rgOwnedApps); this restores name-based matching for those apps too.
+    """
+    name_by_appid = {}
+    for key in humble_keys if isinstance(humble_keys, list) else []:
+        if not isinstance(key, dict):
+            continue
+        appid = key.get("steam_app_id")
+        if appid is None:
+            continue
+        name = key.get("human_name") or key_title(key)
+        if name and not str(name).startswith("<unnamed"):
+            name_by_appid.setdefault(appid, name)
+    return name_by_appid
+
+
+HUB_NAME_RE = re.compile(r"<title>\s*Steam Community ::\s*(.*?)\s*</title>", re.S)
+HUB_MAX_LOOKUPS = 200
+HUB_DELAY = 0.5
+
+
+def fetch_names_from_hubs(app_ids):
+    """Best-effort names for store-delisted apps from their community hubs.
+
+    A hub page's <title> reads "Steam Community :: <name>" and frequently still
+    exists after the store delists the game, often with a "(Retired)" tail.
+    Pages without a hub answer the generic site title and are skipped.
+    """
+    if not app_ids:
+        return {}
+    if len(app_ids) > HUB_MAX_LOOKUPS:
+        message = (
+            f"{len(app_ids)} owned apps lack a catalogue/GetApps entry; hub name "
+            f"lookups skipped: more than {HUB_MAX_LOOKUPS} would risk throttling."
+        )
+        print(message)
+        log(message)
+        return {}
+
+    names = {}
+    for appid in app_ids:
+        try:
+            resp = requests.get(
+                f"https://steamcommunity.com/app/{appid}", timeout=20
+            )
+        except requests.RequestException as e:
+            log(f"hub {appid}: request failed: {e}")
+            continue
+        if resp.status_code in (403, 429):
+            message = (
+                f"Steam is throttling community-hub lookups (HTTP {resp.status_code}); "
+                f"resolved {len(names)} of {len(app_ids)} before stopping."
+            )
+            print(message)
+            log(message)
+            break
+        match = HUB_NAME_RE.search(resp.text)
+        if match:
+            name = html.unescape(match.group(1)).strip()
+            name = re.sub(r"\s*\((?:Retired|retired)\)\s*$", "", name).strip()
+            if name:
+                names[appid] = name
+        time.sleep(HUB_DELAY)
+
+    log(f"hubs: resolved {len(names)} of {len(app_ids)} delisted-name lookups")
+    return names
+
+
+def get_owned_apps(steam_session, humble_name_by_appid=None):
     """Return (owned_app_ids, owned_app_details).
 
     owned_app_details is the appid -> name map for everything owned when a Web API
@@ -1144,11 +1219,24 @@ def get_owned_apps(steam_session):
     missing = [appid for appid in owned_app_ids if appid not in catalog]
     if missing:
         # Bulk lookup by app id first; it covers delisted apps the catalogue
-        # drops and costs a handful of requests. Per-app appdetails is only a
-        # fallback for whatever that leaves behind.
+        # drops and costs a handful of requests.
         resolved = fetch_app_names_bulk(api_key, missing)
         owned_app_details.update(resolved)
         still_missing = [appid for appid in missing if appid not in resolved]
+        if still_missing and humble_name_by_appid:
+            from_humble = {
+                appid: humble_name_by_appid[appid]
+                for appid in still_missing if appid in humble_name_by_appid
+            }
+            if from_humble:
+                print(f"Resolved {len(from_humble)} owned apps by name from your Humble library.")
+                owned_app_details.update(from_humble)
+                still_missing = [appid for appid in still_missing if appid not in from_humble]
+        if still_missing:
+            owned_app_details.update(fetch_names_from_hubs(still_missing))
+            still_missing = [
+                appid for appid in still_missing if appid not in owned_app_details
+            ]
         if still_missing:
             owned_app_details.update(fetch_app_names(steam_session, still_missing))
 
@@ -1415,7 +1503,9 @@ def redeem_steam_keys(humble_session, humble_keys):
     print("Getting your owned content to avoid attempting to register keys already owned...")
 
     # Query owned App IDs according to Steam
-    owned_app_ids, owned_app_details = get_owned_apps(session)
+    owned_app_ids, owned_app_details = get_owned_apps(
+        session, build_humble_name_map(humble_keys)
+    )
 
     noted_keys = [key for key in humble_keys if key["steam_app_id"] not in owned_app_ids]
     skipped_games = {}
@@ -1604,7 +1694,12 @@ def export_mode(humble_session,order_details):
     if(steam_config):
         steam_session = steam_login()
         if(verify_logins_session(steam_session)[1]):
-            owned_app_ids, owned_app_details = get_owned_apps(steam_session)
+            owned_app_ids, owned_app_details = get_owned_apps(
+                steam_session,
+                build_humble_name_map(
+                    list(find_dict_keys(order_details, "steam_app_id", True))
+                ),
+            )
             if owned_app_details is None:
                 # No Web API key, so there is no catalogue to match names against.
                 # Ownership is still exact on the app IDs Humble supplies.

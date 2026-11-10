@@ -1604,12 +1604,22 @@ def choose_games(humble_session,choice_month_name,identifier,chosen):
                 "chosen_identifiers[]":display_name,
                 "is_multikey_and_from_choice_modal":"false"
             }
-            status,res = perform_post(humble_session,HUMBLE_CHOOSE_CONTENT,payload)
-            if not ("success" in res or not res["success"]):
+            try:
+                status, res = perform_post(humble_session, HUMBLE_CHOOSE_CONTENT, payload)
+            except SeleniumPostError as e:
                 print("Error choosing " + choice["title"])
-                print(res)
-            else:
+                print(f"  {e}")
+                log(f"choose_content {choice['title']}: {e}")
+                continue
+            # The old check was inverted: a genuine failure ("success": false)
+            # hit the success arm and printed "Chose game", while a reply
+            # without the key raised KeyError. Anything that is not an
+            # explicit success in a dict is an error here.
+            if isinstance(res, dict) and res.get("success"):
                 print("Chose game " + choice["title"])
+            else:
+                print("Error choosing " + choice["title"])
+                print("  " + repr(res)[:300] + ("" if res is not None else f" (HTTP {status}, non-JSON body)"))
 
 
 def humble_chooser_mode(humble_session,order_details):

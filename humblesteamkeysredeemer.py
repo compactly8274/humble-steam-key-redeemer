@@ -108,6 +108,11 @@ GETAPPS_DELAY = 0.3
 # ~10 failures an hour, so attempts are spaced rather than fired back to back.
 REDEEM_DELAY = 3
 
+# The 53 wait-loop below re-submits the same key roughly every minute.
+# Bound the whole wait: a lockout that outlasts this should end the run
+# instead of spinning forever.
+RATE_LIMIT_MAX_WAIT = 90 * 60
+
 # Set in __main__. None while the module is merely imported, so log() stays quiet
 # for anything that pulls these helpers in without wanting a log file.
 LOG_STREAM = None
@@ -738,20 +743,26 @@ def get_choices(humble_session,order_details):
 
 def _redeem_steam(session, key, quiet=False):
     # Based on https://gist.github.com/snipplets/2156576c2754f8a4c9b43ccb674d5a5d
+    #
+    # Returns the purchase_result_details code on a real reply (0 = success),
+    # or -1 when Steam did not answer with JSON at all: a dead web session, a
+    # login redirect, or a network failure. -1 must not be confused with 53
+    # (rate limited) -- waiting out 53 is correct, waiting out -1 is not,
+    # every retry fails identically.
     if key == "":
         return 0
     cookies = session.cookies.get_dict()
     session_id = cookies.get("sessionid")
     if not session_id:
         print("Error: Steam sessionid cookie missing. Sign in again.")
-        return 53
+        return -1
     try:
         r = session.post(STEAM_REDEEM_API, data={"product_key": key, "sessionid": session_id})
         blob = r.json()
     except ValueError as e:
         if not quiet:
             print(f"Error: Steam activation returned a non-JSON response: {e}")
-        return 53
+        return -1
 
     if blob.get("success") == 1:
         for item in blob.get("purchase_receipt_info", {}).get("line_items", []):
@@ -1510,6 +1521,13 @@ def redeem_steam_keys(humble_session, humble_keys):
         attempted_any = True
 
         code = _redeem_steam(session, key["redeemed_key_val"])
+        if code == -1:
+            # Session gone or endpoint refusing to answer: all later keys
+            # fail the same way, so stop the run instead of grinding them.
+            print("Steam did not answer the activation request with JSON (most likely the web session expired mid-run).")
+            print("Stopping here. Keys redeemed so far are recorded; rerun later to continue.")
+            log(f"redeem_steam_keys: non-retryable Steam response at {key_title(key)}; aborting run")
+            sys.exit(1)
         animation = "|/-\\"
         seconds = 0
         while code == 53:
@@ -1526,6 +1544,13 @@ def redeem_steam_keys(humble_session, humble_keys):
             )
             time.sleep(1)
             seconds = seconds + 1
+            if seconds >= RATE_LIMIT_MAX_WAIT:
+                print(
+                    f"\nSteam is still rate-limiting after {RATE_LIMIT_MAX_WAIT // 60} minutes; "
+                    "stopping the run. This key was not recorded -- rerun later to continue."
+                )
+                log(f"redeem_steam_keys: 53 persisted beyond {RATE_LIMIT_MAX_WAIT}s; aborting run")
+                sys.exit(1)
             if seconds % 60 == 0:
                 # Try again every 60 seconds
                 code = _redeem_steam(session, key["redeemed_key_val"], quiet=True)

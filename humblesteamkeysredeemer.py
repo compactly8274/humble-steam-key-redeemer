@@ -525,7 +525,12 @@ fetch("https://www.humblebundle.com/home/library").then(r => {done(!r.redirected
 def verify_logins_session(session):
     # Returns [humble_status, steam_status]
     if type(session) is requests.Session:
-        loggedin = session.get(STEAM_KEYS_PAGE, allow_redirects=False, timeout=15).status_code not in (301,302)
+        # Only an unambiguous 200 counts: Steam redirecting (301/302/303)
+        # means logged out, and an error page does too.
+        loggedin = (
+            session.get(STEAM_KEYS_PAGE, allow_redirects=False, timeout=15).status_code
+            == 200
+        )
         return [False,loggedin]
     else:
         return [session.execute_async_script(is_logged_in),False]
@@ -1192,10 +1197,22 @@ def get_owned_apps(steam_session, humble_name_by_appid=None):
     key is configured, or None when callers must fall back to per-title searches.
     """
     owned_content = steam_json(steam_session, STEAM_USERDATA_API, "your Steam user data")
-    if owned_content is None or "rgOwnedApps" not in owned_content:
-        print("Could not read your owned Steam apps. Delete .steamcookies and sign in again.")
+    # The key existing is not enough: an unauthenticated dynamicstore request
+    # answers valid JSON with rgOwnedApps == []. Treating that as "owns
+    # nothing" sends every owned key to redemption -- against a ~10-failures-
+    # per-hour quota, that is a catastrophe. A truly empty library is valid
+    # only alongside an empty key list at all, which this tool cannot have.
+    if (
+        not owned_content
+        or "rgOwnedApps" not in owned_content
+        or not owned_content["rgOwnedApps"]
+    ):
+        print("Could not read your owned Steam apps -- the ownership data came back EMPTY.")
+        print("That means the stored Steam session is no longer signed in, even if it")
+        print("looked healthy. Delete .steamcookies and rerun to sign in fresh.")
         print("Stopping rather than attempting every key: Steam allows only ~10 failed")
         print("keys per hour, and keys you already own count as failures.")
+        log("steam ownership data empty -- stored session likely dead; aborting")
         sys.exit(1)
 
     # Only app IDs: rgOwnedPackages holds package IDs, a different namespace from

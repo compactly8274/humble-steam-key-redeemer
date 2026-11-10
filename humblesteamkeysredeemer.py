@@ -927,7 +927,10 @@ def load_steam_api_config():
     if not os.path.exists(STEAM_API_KEY_FILE):
         return None, None
     try:
-        with open(STEAM_API_KEY_FILE, "r", encoding="utf-8") as f:
+        # utf-8-sig transparently strips a BOM if a text editor (Notepad)
+        # saved the file as "UTF-8 with BOM"; otherwise the key line would
+        # carry an invisible \ufeff and every Steam API call would 403.
+        with open(STEAM_API_KEY_FILE, "r", encoding="utf-8-sig") as f:
             lines = [ln.strip() for ln in f.read().splitlines()]
     except OSError:
         print(f"Warning: couldn't read {STEAM_API_KEY_FILE}; falling back to session-based ownership.")
@@ -960,11 +963,21 @@ def fetch_owned_via_webapi(api_key, steamid):
         requests, STEAM_OWNEDGAMES_API, "your owned games (Web API)",
         params=params, timeout=60,
     )
-    if body is None:
+    if not isinstance(body, dict):
+        # A JSON array or scalar here is never a successful GetOwnedGames
+        # payload; treat it like any other unusable response.
+        log(f"GetOwnedGames returned non-dict body: {str(body)[:200]}")
         return None
     response = body.get("response", {})
     if response.get("game_count") == 0:
-        return set(), {}
+        # An empty owned library is never valid for this tool (a key/steamid
+        # mismatch produces exactly this shape). Returning an empty set would
+        # make verify call everything unowned and redeem attempt everything;
+        # let the caller fall back to the authenticated path instead.
+        print("The Web API reports zero owned games -- treating as unusable and")
+        print("falling back to the signed-in path (a wrong SteamID64 also reads as 0).")
+        log("GetOwnedGames game_count=0; refusing to treat as an owned set")
+        return None
     games = response.get("games")
     if not games:
         print("The Web API did not return your owned games; falling back to the signed-in path.")

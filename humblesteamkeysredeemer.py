@@ -365,13 +365,14 @@ Which key export mode would you like to use?
 [1] Auto-Redeem
 [2] Export keys
 [3] Humble Choice chooser
+[4] Verify keys (report-only: compares Humble to your live Steam ownership)
 """
 def prompt_mode(order_details,humble_session):
     mode = None
-    while mode not in ["1","2","3"]:
+    while mode not in ["1","2","3","4"]:
         print(MODE_PROMPT)
-        mode = input("Choose 1, 2, or 3: ").strip()
-        if mode in ["1","2","3"]:
+        mode = input("Choose 1, 2, 3, or 4: ").strip()
+        if mode in ["1","2","3","4"]:
             return mode
         print("Invalid mode")
     return mode
@@ -1663,6 +1664,146 @@ def redeem_steam_keys(humble_session, humble_keys):
         write_key(code, key)
 
 
+VERIFY_REPORT = "steam_keys_status.csv"
+
+
+def verify_steam_keys(humble_keys):
+    """Report-only cross-check of Humble keys against Steam's live ownership.
+
+    "Redeemed" in an output file *should* mean the game is owned on Steam; a
+    crash, a dead session, or a mis-recorded run can break that promise
+    without either side noticing. Every Steam key is compared to the current
+    owned-app set -- exact app-id first (the ids include store-delisted apps
+    the catalogue omits), title matching only where Humble supplies no id --
+    and the result lands in steam_keys_status.csv with the interesting rows
+    called out on screen. Nothing is redeemed here.
+    """
+    session = steam_login()
+
+    print("Successfully signed in on Steam.")
+    owned_app_ids, owned_app_details = get_owned_apps(
+        session, build_humble_name_map(humble_keys)
+    )
+
+    catalog_index = (
+        build_ownership_index(owned_app_details) if owned_app_details is not None else None
+    )
+    search_cache = {}
+
+    # Same recorded-history maps the auto-redeem filter uses, per file, so the
+    # report can show which keys earlier runs already handled (and label them).
+    file_labels_by_keyval = {}
+    file_labels_by_entry = {}
+    for filter_file in ("errored.csv", "already_owned.csv", "redeemed.csv"):
+        try:
+            with open(filter_file, "r", encoding="utf-8-sig", newline="") as f:
+                for row in csv.reader(f):
+                    if not row or row[0].strip() == "gamekey":
+                        continue
+                    if len(row) > 2 and row[2].strip():
+                        val = row[2].strip()
+                        file_labels_by_keyval.setdefault(val, [])
+                        if filter_file not in file_labels_by_keyval[val]:
+                            file_labels_by_keyval[val].append(filter_file)
+                    if len(row) > 3 and row[3].strip():
+                        entry = (row[0].strip(), row[3].strip())
+                        file_labels_by_entry.setdefault(entry, [])
+                        if filter_file not in file_labels_by_entry[entry]:
+                            file_labels_by_entry[entry].append(filter_file)
+        except FileNotFoundError:
+            pass
+
+    headers = [
+        "gamekey", "keyindex", "human_name", "redeemed_key_val",
+        "steam_app_id", "revealed", "owned_on_steam", "match_source", "recorded_in",
+    ]
+    rows = []
+    for key in humble_keys:
+        title = key_title(key)
+        appid = key.get("steam_app_id")
+        revealed = "yes" if "redeemed_key_val" in key else "no"
+
+        if owned_app_details is None:
+            key_index = build_ownership_index(
+                search_owned_candidates(session, title, owned_app_ids, search_cache)
+            )
+        else:
+            key_index = catalog_index
+
+        if appid is not None:
+            owned = "owned" if appid in owned_app_ids else "not-owned"
+            source = "exact-appid"
+        else:
+            verdict, _score, _matched = classify_ownership(key_index, key)
+            if verdict == OWNED:
+                owned, source = "owned", "title"
+            elif verdict == UNCERTAIN:
+                owned, source = "uncertain", "title"
+            else:
+                owned, source = "not-owned", "title"
+
+        labels = []
+        value = key.get("redeemed_key_val")
+        if value and value in file_labels_by_keyval:
+            labels.extend(file_labels_by_keyval[value])
+        keyindex = key.get("keyindex")
+        if keyindex is not None:
+            entry = (str(key.get("gamekey")), str(keyindex))
+            if entry in file_labels_by_entry:
+                labels.extend(file_labels_by_entry[entry])
+        labels = list(dict.fromkeys(labels))  # key value and entry often hit the same file
+
+        rows.append({
+            "gamekey": key.get("gamekey", ""),
+            "keyindex": key.get("keyindex", ""),
+            "human_name": title,
+            "redeemed_key_val": key.get("redeemed_key_val", ""),
+            "steam_app_id": appid if appid is not None else "",
+            "revealed": revealed,
+            "owned_on_steam": owned,
+            "match_source": source if appid is None or owned == "owned" else "",
+            "recorded_in": ";".join(labels),
+        })
+
+    with open(VERIFY_REPORT, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    n_revealed = sum(1 for r in rows if r["revealed"] == "yes")
+    verified = [r for r in rows if r["revealed"] == "yes" and r["owned_on_steam"] == "owned"]
+    suspects = [r for r in rows if r["revealed"] == "yes" and r["owned_on_steam"] == "not-owned"]
+    unowned_unrevealed = [r for r in rows if r["revealed"] == "no" and r["owned_on_steam"] == "not-owned"]
+    owned_unrevealed = [r for r in rows if r["revealed"] == "no" and r["owned_on_steam"] == "owned"]
+    retries = [r for r in rows if r["owned_on_steam"] == "not-owned"
+               and any(f in (r["recorded_in"] or "") for f in ("errored.csv", "already_owned.csv"))]
+
+    print(f"{len(rows)} Steam keys checked -> full detail in {VERIFY_REPORT}")
+    print(f"  revealed and owned on Steam (redeemed): {len(verified)}")
+    print(f"  revealed but NOT owned on Steam:        {len(suspects)}"
+          "  <-- a past run recorded a redeem Steam never applied, or the key was redeemed elsewhere/gifted")
+    print(f"  unrevealed but owned on Steam:          {len(owned_unrevealed)}"
+          "  (gift links deliberately preserved; skipped as owned by design)")
+    print(f"  unrevealed and not owned on Steam:      {len(unowned_unrevealed)}"
+          "  (genuine candidates for the next auto-redeem run)")
+    if retries:
+        print(f"  keys recorded failed/owned in earlier runs but now unowned: {len(retries)}"
+          "  <-- earlier-recorded results look wrong; candidates to retry")
+
+    if suspects:
+        print("Revealed-but-not-owned keys:")
+        for row in suspects[:40]:
+            print(f"    {row['human_name']}"
+                  + (f"  [recorded in {row['recorded_in']}]" if row["recorded_in"] else ""))
+        if len(suspects) > 40:
+            print(f"    ... and {len(suspects) - 40} more (see {VERIFY_REPORT})")
+    log(
+        f"verify: {len(rows)} keys; redeemed+owned {len(verified)}; "
+        f"revealed-not-owned {len(suspects)}; unrevealed {len(rows) - n_revealed}"
+    )
+
+
 def export_mode(humble_session,order_details):
     cls()
 
@@ -1922,12 +2063,19 @@ def main():
     order_details = driver.execute_async_script(getHumbleOrders.replace('%optional%',''))
     order_details = require_humble_orders(order_details, "the whole run")
 
-    desired_mode = prompt_mode(order_details,driver)
+    if "--verify" in sys.argv:
+        desired_mode = "4"
+    else:
+        desired_mode = prompt_mode(order_details,driver)
     if(desired_mode == "2"):
         export_mode(driver,order_details)
         return
     if(desired_mode == "3"):
         humble_chooser_mode(driver,order_details)
+        return
+    if(desired_mode == "4"):
+        cls()
+        verify_steam_keys(list(find_dict_keys(order_details, "steam_app_id", True)))
         return
 
     # Auto-Redeem mode

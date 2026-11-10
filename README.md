@@ -20,6 +20,18 @@ This is great if you want a manual review of what games are in your keys list th
 For those subscribed to Humble Choice, this mode will find any Humble Monthly/Choice that has unclaimed choices, and will let you select, reveal, and optionally autoredeem on Steam the keys you select
 
 #
+### Verify Mode
+
+Report-only cross-check of the whole Humble Steam key list against your
+current Steam ownership: every revealed key is checked by its app id
+(title matching only where Humble supplies no id), and the result is
+written to `steam_keys_status.csv`. Keys your Steam account does *not*
+own despite being revealed -- a past run that recorded a redeem Steam
+never applied, or a key redeemed elsewhere/gifted -- surface as suspects
+for review, as do keys recorded in `errored.csv`/`already_owned.csv`
+that you in fact do not own. Nothing is redeemed in this mode; run it
+from the menu or with `python humblesteamkeysredeemer.py --verify`.
+
 ### Notes
 
 To remove an already added account, delete the associated `.(humble|steam)cookies` file.

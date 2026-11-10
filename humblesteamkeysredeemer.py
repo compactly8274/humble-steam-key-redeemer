@@ -239,22 +239,37 @@ var getHumbleOrderDetails = async (list) => {
 getHumbleOrderDetails(list).then(r => {done(r)});
 '''
 
+class SeleniumPostError(Exception):
+    """A POST run in the browser did not complete with a readable response."""
+
 fetch_cmd = '''
 var done = arguments[arguments.length - 1];
-var formData = new FormData();
-const jsonData = JSON.parse(atob('{formData}'));
+try {{
+    var formData = new FormData();
+    const jsonData = JSON.parse(atob('{formData}'));
 
-for (const key in jsonData) {{
-    formData.append(key,jsonData[key])
+    for (const key in jsonData) {{
+        formData.append(key,jsonData[key])
+    }}
+
+    fetch("{url}", {{
+        "headers": {{
+            "csrf-prevention-token": "{csrf}"
+        }},
+        "body": formData,
+        "method": "POST"
+    }})
+    .then(r => {{
+        // Answer with the raw body: r.json() rejects on HTML/error pages and
+        // the rejection was swallowed, leaving done() uncalled until
+        // Selenium's script timeout killed the whole run. Python now parses
+        // the text.
+        r.text().then( v=>{{done([r.status,v])}} )
+    }})
+    .catch(e => done(["NETWORK_ERROR",String(e)]));
+}} catch (e) {{
+    done(["JS_ERROR",String(e)]);
 }}
-
-fetch("{url}", {{
-  "headers": {{
-    "csrf-prevention-token": "{csrf}"
-    }},
-  "body": formData,
-  "method": "POST",
-}}).then(r => {{ r.json().then( v=>{{done([r.status,v])}} ) }} );
 '''
 
 def perform_post(driver,url,payload):
@@ -263,9 +278,27 @@ def perform_post(driver,url,payload):
     csrf = csrf['value'] if csrf is not None else ''
     if csrf is None:
         csrf = ''
-    script = fetch_cmd.format(formData=json_payload,url=url,csrf=csrf)
+    try:
+        status, body = driver.execute_async_script(
+            fetch_cmd.format(formData=json_payload, url=url, csrf=csrf)
+        )
+    except WebDriverException as e:
+        # Covers TimeoutException: the callback never settled, so the exact
+        # server reply is unknown -- surface that instead of a bare traceback.
+        raise SeleniumPostError(
+            f"script in the browser did not complete for {url} ({type(e).__name__})"
+        )
 
-    return driver.execute_async_script(fetch_cmd.format(formData=json_payload,url=url,csrf=csrf))
+    if status in ("NETWORK_ERROR", "JS_ERROR"):
+        raise SeleniumPostError(f"{status} for {url}: {body}")
+
+    # Body arrives as text; parse it here so an HTML/Cloudflare error page
+    # becomes a labelled failure instead of an unsettled promise.
+    try:
+        parsed = json.loads(body)
+    except (ValueError, TypeError):
+        parsed = None
+    return status, parsed
 
 def process_quit(driver):
     def quit_on_exit(*args):
@@ -288,6 +321,9 @@ def get_headless_driver():
             else:
                 options.add_argument("-headless")
             driver = d(options=options)
+            # A slow-but-legit POST must not be cut at Selenium's ~30s
+            # script-timeout default and kill the run with it.
+            driver.set_script_timeout(60)
             process_quit(driver) # make sure driver closes when we close
             return driver
         except WebDriverException as e:
@@ -480,6 +516,12 @@ def do_login(driver,payload):
             print(f"humblebundle.com has responded with an error (HTTP status code {auth}: {responses[auth]}).")
             time.sleep(30)
             sys.exit()
+        if not isinstance(login_json, dict):
+            # humble_login's "errors" membership tests assume a dict; a 200
+            # reply that is not JSON fails here, loudly, instead of TypeError.
+            print(f"humblebundle.com sent a non-JSON login response (HTTP {auth}).")
+            time.sleep(3)
+            sys.exit(1)
         return auth,login_json
 
 def humble_login(driver):
@@ -591,12 +633,25 @@ def redeem_humble_key(sess, tpk):
     # Keys need to be 'redeemed' on Humble first before the Humble API gives the user a Steam key.
     # This triggers that for a given Humble key entry
     payload = {"keytype": tpk["machine_name"], "key": tpk["gamekey"], "keyindex": tpk["keyindex"]}
-    status,respjson = perform_post(sess, HUMBLE_REDEEM_API, payload)
-    
-    if status != 200 or "error_msg" in respjson or not respjson["success"]:
+    try:
+        status, respjson = perform_post(sess, HUMBLE_REDEEM_API, payload)
+    except SeleniumPostError as e:
+        # A failed POST used to abort the whole run with a script-timeout
+        # traceback; it now fails exactly this key and redemption continues.
         print("Error redeeming key on Humble for " + key_title(tpk))
-        if("error_msg" in respjson):
+        print(f"  {e}")
+        log(f"redeem_humble_key {key_title(tpk)}: {e}")
+        return ""
+
+    if status != 200 or not isinstance(respjson, dict) or not respjson.get("success"):
+        # respjson is None for non-JSON replies; the dict guard keeps this a
+        # readable failure instead of a KeyError.
+        print("Error redeeming key on Humble for " + key_title(tpk))
+        if isinstance(respjson, dict) and "error_msg" in respjson:
             print(respjson["error_msg"])
+        else:
+            print(f"  HTTP {status}" + ("" if isinstance(respjson, dict) else " (non-JSON body)"))
+        log(f"redeem_humble_key {key_title(tpk)}: HTTP {status}, body={str(respjson)[:200]}")
         return ""
     try:
         return respjson["key"]

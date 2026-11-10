@@ -180,6 +180,7 @@ STEAM_APP_DETAILS_API = "https://store.steampowered.com/api/appdetails"
 STEAM_APP_SEARCH_API = "https://steamcommunity.com/actions/SearchApps/"
 STEAM_GETAPPS_API = "https://api.steampowered.com/ICommunityService/GetApps/v1/"
 STEAM_API_KEY_FILE = "steam_api_key.txt"
+STEAM_OWNEDGAMES_API = "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/"
 
 # May actually be able to do without these, but for now they're in.
 # Per-game ownership prompts, restored with --interactive. Off by default: with
@@ -915,17 +916,73 @@ def prompt_yes_no(question):
         else:
             return True if ans == "y" else False
 
-def load_steam_api_key():
-    # Optional. With a key we can pull Steam's whole catalogue in a few requests;
-    # without one we fall back to per-title searches.
+def load_steam_api_config():
+    """(key, steamid64-or-None) from steam_api_key.txt.
+
+    Line 1: the Web API key (as before). Optional line 2: your 17-digit
+    SteamID64 -- a bare id or a full profile URL both work. With the id
+    present, ownership is read through IPlayerService/GetOwnedGames with no
+    signed-in session at all; lines starting with '#' are ignored.
+    """
     if not os.path.exists(STEAM_API_KEY_FILE):
-        return None
+        return None, None
     try:
         with open(STEAM_API_KEY_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip() or None
+            lines = [ln.strip() for ln in f.read().splitlines()]
     except OSError:
-        print(f"Warning: couldn't read {STEAM_API_KEY_FILE}; falling back to per-title lookups.")
+        print(f"Warning: couldn't read {STEAM_API_KEY_FILE}; falling back to session-based ownership.")
+        return None, None
+    lines = [ln for ln in lines if ln and not ln.startswith("#")]
+    key = lines[0] if lines else None
+    steamid = None
+    for extra in lines[1:]:
+        match = re.search(r"7656\d{13}", extra)
+        if match:
+            steamid = match.group(0)
+            break
+    return key or None, steamid
+
+
+def fetch_owned_via_webapi(api_key, steamid):
+    """Owned games via IPlayerService/GetOwnedGames -- key-only, no session.
+
+    Returns (owned_app_ids, owned_app_details) or None to fall back to the
+    session-based path. GetOwnedGames includes store-delisted apps, so this
+    also outdates the delisted-names ladder when it succeeds.
+    """
+    params = {
+        "key": api_key,
+        "steamid": steamid,
+        "include_appinfo": 1,
+        "include_played_free_games": 1,
+    }
+    body = steam_json(
+        requests, STEAM_OWNEDGAMES_API, "your owned games (Web API)",
+        params=params, timeout=60,
+    )
+    if body is None:
         return None
+    response = body.get("response", {})
+    if response.get("game_count") == 0:
+        return set(), {}
+    games = response.get("games")
+    if not games:
+        print("The Web API did not return your owned games; falling back to the signed-in path.")
+        print("(Check that the SteamID64 in steam_api_key.txt belongs to the key's account.)")
+        log(f"GetOwnedGames unusable: response={str(response)[:200]}")
+        return None
+    owned_app_ids = set()
+    owned_app_details = {}
+    for game in games:
+        if not isinstance(game, dict) or game.get("appid") is None:
+            continue
+        owned_app_ids.add(game["appid"])
+        name = game.get("name")
+        if name:
+            owned_app_details[game["appid"]] = name
+    print(f"Ownership read through the Web API key: {len(owned_app_ids)} games, no sign-in session needed.")
+    log(f"webapi ownership: {len(owned_app_ids)} ids, {len(owned_app_details)} named")
+    return owned_app_ids, owned_app_details
 
 
 def steam_json(steam_session, url, what, **kwargs):
@@ -1193,9 +1250,25 @@ def fetch_names_from_hubs(app_ids):
 def get_owned_apps(steam_session, humble_name_by_appid=None):
     """Return (owned_app_ids, owned_app_details).
 
-    owned_app_details is the appid -> name map for everything owned when a Web API
-    key is configured, or None when callers must fall back to per-title searches.
+    With a Web API key + SteamID64 in steam_api_key.txt everything comes from
+    IPlayerService -- no signed-in session is touched, and steam_session may be
+    None. Every other path needs it. owned_app_details is the appid -> name map
+    for everything owned, or None when callers must fall back to per-title
+    searches.
     """
+    api_key, steamid = load_steam_api_config()
+    if api_key and steamid:
+        webapi = fetch_owned_via_webapi(api_key, steamid)
+        if webapi is not None:
+            return webapi
+
+    if steam_session is None:
+        print("Ownership cannot be read: no Web API key + SteamID64 in steam_api_key.txt")
+        print("and no signed-in Steam session. Add the key with your SteamID64 on line 2,")
+        print("or rerun so the tool can sign in.")
+        log("get_owned_apps: no webapi pair and no session; aborting")
+        sys.exit(1)
+
     owned_content = steam_json(steam_session, STEAM_USERDATA_API, "your Steam user data")
     # The key existing is not enough: an unauthenticated dynamicstore request
     # answers valid JSON with rgOwnedApps == []. Treating that as "owns
@@ -1209,7 +1282,9 @@ def get_owned_apps(steam_session, humble_name_by_appid=None):
     ):
         print("Could not read your owned Steam apps -- the ownership data came back EMPTY.")
         print("That means the stored Steam session is no longer signed in, even if it")
-        print("looked healthy. Delete .steamcookies and rerun to sign in fresh.")
+        print("looked healthy. Delete .steamcookies and rerun to sign in fresh, or put a")
+        print("Web API key with your SteamID64 (line 2) into steam_api_key.txt to skip")
+        print("the session entirely.")
         print("Stopping rather than attempting every key: Steam allows only ~10 failed")
         print("keys per hour, and keys you already own count as failures.")
         log("steam ownership data empty -- stored session likely dead; aborting")
@@ -1219,7 +1294,6 @@ def get_owned_apps(steam_session, humble_name_by_appid=None):
     # the Steam app IDs Humble reports, so comparing against them is meaningless.
     owned_app_ids = set(owned_content["rgOwnedApps"])
 
-    api_key = load_steam_api_key()
     if not api_key:
         print("No Steam Web API key found; matching titles individually instead.")
         print("For faster matching, put a key from https://steamcommunity.com/dev/apikey")
@@ -1695,11 +1769,14 @@ def verify_steam_keys(humble_keys):
     and the result lands in steam_keys_status.csv with the interesting rows
     called out on screen. Nothing is redeemed here.
     """
-    session = steam_login()
-
-    print("Successfully signed in on Steam.")
+    _api_key, _steamid = load_steam_api_config()
+    steam_session = None if (_api_key and _steamid) else steam_login()
+    if steam_session is None:
+        print("Web API key + SteamID64 configured -- verifying without a Steam sign-in.")
+    else:
+        print("Successfully signed in on Steam.")
     owned_app_ids, owned_app_details = get_owned_apps(
-        session, build_humble_name_map(humble_keys)
+        steam_session, build_humble_name_map(humble_keys)
     )
 
     catalog_index = (
@@ -1742,7 +1819,7 @@ def verify_steam_keys(humble_keys):
 
         if owned_app_details is None:
             key_index = build_ownership_index(
-                search_owned_candidates(session, title, owned_app_ids, search_cache)
+                search_owned_candidates(steam_session, title, owned_app_ids, search_cache)
             )
         else:
             key_index = catalog_index

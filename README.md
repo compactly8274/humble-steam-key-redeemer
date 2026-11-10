@@ -30,6 +30,7 @@ own despite being revealed -- a past run that recorded a redeem Steam
 never applied, or a key redeemed elsewhere/gifted -- surface as suspects
 for review, as do keys recorded in `errored.csv`/`already_owned.csv`
 that you in fact do not own. Nothing is redeemed in this mode; run it
+with no login prompt at all when the Web API key + SteamID64 pair is set.
 from the menu or with `python humblesteamkeysredeemer.py --verify`.
 
 ### Notes
@@ -39,8 +40,12 @@ To remove an already added account, delete the associated `.(humble|steam)cookie
 ### Dependencies
 
 Requires Python 3.8 or above (selenium 4.10 needs it; known-good on 3.13 and 3.15).
-Optional but recommended: a Steam Web API key in `steam_api_key.txt`
+Optional but strongly recommended: a Steam Web API key in `steam_api_key.txt`
 (https://steamcommunity.com/dev/apikey) for much faster ownership matching.
+Add your 17-digit SteamID64 (or your profile URL) on a **second line** and
+ownership is read directly through the Web API: no Steam sign-in session is
+needed at all, and `--verify` runs without any login. Delisted games are
+included in that list, so the name-resolution ladder rarely has work left.
 
 - `steam`: [ValvePython/steam](https://github.com/ValvePython/steam)  
 - `fuzzywuzzy`: [seatgeek/fuzzywuzzy](https://github.com/seatgeek/fuzzywuzzy)  

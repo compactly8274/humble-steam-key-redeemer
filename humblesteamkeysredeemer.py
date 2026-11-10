@@ -228,11 +228,25 @@ var getHumbleOrderDetails = async (list) => {
       return orderDetails;
     });
 
-    const orderDetailsArray = await Promise.all(orderDetailsPromises);
+    const settled = await Promise.allSettled(orderDetailsPromises);
+    const orderDetailsArray = settled
+      .filter(s => s.status === 'fulfilled')
+      .map(s => s.value);
+    const failed = settled.filter(s => s.status === 'rejected');
+    if (failed.length) {
+      console.error('Humble order detail fetches failed: ' + failed.length + ' of ' + settled.length);
+    }
+    if (failed.length && !orderDetailsArray.length) {
+      // The old code returned [] whenever any single fetch failed, turning
+      // the whole library into a silent no-op run. A total failure now gets
+      // a marker object that the Python side refuses loudly.
+      return {humble_orders_fetch_failed: true, failed: failed.length,
+              reason: String(failed[0].reason)};
+    }
     return orderDetailsArray;
   } catch (error) {
     console.error('Error:', error);
-    return [];
+    return {humble_orders_fetch_failed: true, failed: 0, reason: String(error)};
   }
 };
 
@@ -1720,8 +1734,14 @@ def humble_chooser_mode(humble_session,order_details):
         if(redeem_keys and len(try_redeem_keys) > 0):
             print("Redeeming keys now!")
             updated_monthlies = humble_session.execute_async_script(getHumbleOrders.replace('%optional%',json.dumps(try_redeem_keys)))
-            chosen_keys = list(find_dict_keys(updated_monthlies,"steam_app_id",True))
-            redeem_steam_keys(humble_session,chosen_keys)
+            if not isinstance(updated_monthlies, list):
+                # The subset refetch failed; the just-chosen keys simply do
+                # not auto-redeem this run instead of crashing.
+                print("Could not refetch the chosen orders; skipping auto-redeem of the just-chosen keys.")
+                log(f"chooser: subset refetch failed ({str(updated_monthlies)[:200]})")
+            else:
+                chosen_keys = list(find_dict_keys(updated_monthlies,"steam_app_id",True))
+                redeem_steam_keys(humble_session,chosen_keys)
 
 def cls():
     os.system('cls' if os.name=='nt' else 'clear')
@@ -1730,6 +1750,24 @@ def cls():
 def print_main_header():
     print("-=FailSpy's Humble Bundle Helper!=-")
     print("--------------------------------------")
+
+def require_humble_orders(order_details, context):
+    """A list of Humble orders, or a refuse-point marker dict on total failure.
+
+    getHumbleOrders used to return [] whenever a detail fetch failed, and a
+    run then behaved as a silent no-op: 0 keys, an empty export, "no
+    choices". Partial failures keep the successful orders; a total failure
+    lands here and stops the run with the reason.
+    """
+    if isinstance(order_details, list):
+        return order_details
+    reason = str(order_details.get("reason", "")) if isinstance(order_details, dict) else ""
+    print(f"Humble order details could not be fetched ({context}).")
+    if reason:
+        print(f"  {reason}")
+    print("Check the Humble site in a real browser (sign-in state / Cloudflare challenge), then rerun.")
+    log(f"humble orders fetch failed ({context}): {reason or 'total failure marker'}")
+    sys.exit(1)
 
 
 def main():
@@ -1746,6 +1784,7 @@ def main():
     print(f"Getting order details, please wait")
 
     order_details = driver.execute_async_script(getHumbleOrders.replace('%optional%',''))
+    order_details = require_humble_orders(order_details, "the whole run")
 
     desired_mode = prompt_mode(order_details,driver)
     if(desired_mode == "2"):

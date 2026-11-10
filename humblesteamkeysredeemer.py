@@ -185,12 +185,6 @@ STEAM_API_KEY_FILE = "steam_api_key.txt"
 # the matching below, the prompt only ever fired on wrong candidates.
 INTERACTIVE_MATCHING = False
 
-headers = {
-    "Content-Type": "application/x-www-form-urlencoded",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-}
-
-
 def find_dict_keys(node, kv, parent=False):
     if isinstance(node, list):
         for i in node:
@@ -382,8 +376,12 @@ def prompt_mode(order_details,humble_session):
     return mode
 
 
+STEAM_KEY_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-")
+
 def valid_steam_key(key):
-    # Steam keys are in the format of AAAAA-BBBBB-CCCCC
+    # Steam keys are in the format of AAAAA-BBBBB-CCCCC -- uppercase A-Z0-9,
+    # compared case-insensitively here. Dashes-only junk, punctuation or
+    # unicode digits are not redeemable product keys.
     if not isinstance(key, str):
         return False
     key_parts = key.split("-")
@@ -391,6 +389,7 @@ def valid_steam_key(key):
         len(key) == 17
         and len(key_parts) == 3
         and all(len(part) == 5 for part in key_parts)
+        and set(key.upper()) <= STEAM_KEY_CHARS
     )
 
 
@@ -524,7 +523,7 @@ fetch("https://www.humblebundle.com/home/library").then(r => {done(!r.redirected
 def verify_logins_session(session):
     # Returns [humble_status, steam_status]
     if type(session) is requests.Session:
-        loggedin = session.get(STEAM_KEYS_PAGE, allow_redirects=False).status_code not in (301,302)
+        loggedin = session.get(STEAM_KEYS_PAGE, allow_redirects=False, timeout=15).status_code not in (301,302)
         return [False,loggedin]
     else:
         return [session.execute_async_script(is_logged_in),False]
@@ -532,7 +531,7 @@ def verify_logins_session(session):
 def do_login(driver,payload):
         auth,login_json = perform_post(driver,HUMBLE_LOGIN_API,payload)
         if auth not in (200,401):
-            print(f"humblebundle.com has responded with an error (HTTP status code {auth}: {responses[auth]}).")
+            print(f"humblebundle.com has responded with an error (HTTP status code {auth}: {responses.get(auth, 'unknown status')}).")
             time.sleep(30)
             sys.exit()
         if not isinstance(login_json, dict):
@@ -682,11 +681,21 @@ def get_month_data(humble_session,month):
     # No real API for this, seems to just be served on the webpage.
     if type(humble_session) is not requests.Session:
         raise Exception("get_month_data needs a configured requests session")
-    r = humble_session.get(HUMBLE_SUB_PAGE + month["product"]["choice_url"])
+    r = humble_session.get(
+        HUMBLE_SUB_PAGE + month["product"]["choice_url"],
+        timeout=30,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+    )
 
-    data_indicator = f'<script id="webpack-monthly-product-data" type="application/json">'
-    jsondata = r.text.split(data_indicator)[1].split("</script>")[0].strip()
-    jsondata = json.loads(jsondata)
+    data_indicator = '<script id="webpack-monthly-product-data" type="application/json">'
+    if data_indicator not in r.text:
+        # A logged-out or Cloudflare-challenged page lacks the data block;
+        # the old split() crashed with a bare IndexError.
+        raise Exception(
+            f"month page (HTTP {r.status_code}) did not contain the choice data "
+            "block -- the chooser session probably lapsed"
+        )
+    jsondata = json.loads(r.text.split(data_indicator)[1].split("</script>")[0].strip())
     return jsondata["contentChoiceOptions"]
 
 
@@ -703,7 +712,6 @@ def get_choices(humble_session,order_details):
         # convert cookies to requests
         request_session.cookies.set(cookie['name'],cookie['value'],domain=cookie['domain'].replace('www.',''),path=cookie['path'])
 
-    choices = []
     for month in months:
         if month["choices_remaining"] > 0 or month["product"].get("is_subs_v3_product",False): # subs v3 products don't advertise choices, need to get them exhaustively
             chosen_games = set(find_dict_keys(month["tpkd_dict"],"machine_name"))
@@ -952,7 +960,11 @@ def fetch_steam_catalog(steam_session, api_key):
 
         response = body.get("response", {})
         page = response.get("apps", [])
-        catalog.update({app["appid"]: app["name"] for app in page})
+        catalog.update({
+            app["appid"]: app["name"]
+            for app in page
+            if isinstance(app, dict) and app.get("appid") is not None and app.get("name")
+        })
 
         if not page or not response.get("have_more_results"):
             break
@@ -1079,7 +1091,7 @@ def search_owned_candidates(steam_session, game_name, owned_app_ids, cache):
 
     results = steam_json(
         steam_session,
-        STEAM_APP_SEARCH_API + requests.utils.quote(term),
+        STEAM_APP_SEARCH_API + requests.utils.quote(term, safe=""),
         f'the Steam search for "{term}"',
         timeout=20,
     )
@@ -1480,9 +1492,12 @@ def redeem_steam_keys(humble_session, humble_keys):
     # hour, so the quota should go to the keys most likely to actually redeem --
     # and a run stopped part way through will have spent it on those.
     uncertain_ids = {id(game) for game in uncertain_games}
+    # Position lookups once instead of list.index inside the sort key, which
+    # re-scans and dict-compares per comparison (O(n^2) over the library).
+    order_index = {id(game): position for position, game in enumerate(humble_keys)}
     unownedgames = sorted(
         unownedgames,
-        key=lambda g: (id(g) in uncertain_ids, humble_keys.index(g)),
+        key=lambda g: (id(g) in uncertain_ids, order_index.get(id(g), 0)),
     )
 
 
@@ -1674,7 +1689,7 @@ def humble_chooser_mode(humble_session,order_details):
         ready = False
         while not ready:
             cls()
-            if month["choice_data"]["usesChoices"]:
+            if month["choice_data"].get("usesChoices",True):
                 remaining = month["choices_remaining"]
                 print()
                 print(month["product"]["human_name"])
@@ -1686,9 +1701,10 @@ def humble_chooser_mode(humble_session,order_details):
             for idx,choice in enumerate(choices):
                 title = choice["title"]
                 rating_text = ""
-                if("review_text" in choice["user_rating"] and "steam_percent|decimal" in choice["user_rating"]):
-                    rating = choice["user_rating"]["review_text"].replace('_',' ')
-                    percentage = str(int(choice["user_rating"]["steam_percent|decimal"]*100)) + "%"
+                rating_block = choice.get("user_rating")
+                if(isinstance(rating_block, dict) and "review_text" in rating_block and "steam_percent|decimal" in rating_block):
+                    rating = rating_block["review_text"].replace('_',' ')
+                    percentage = str(int(rating_block["steam_percent|decimal"]*100)) + "%"
                     rating_text = f" - {rating}({percentage})"
                 exception = ""
                 if "tpkds" not in choice:
@@ -1806,7 +1822,7 @@ def main():
     humble_login(driver)
     print("Successfully signed in on Humble.")
 
-    print(f"Getting order details, please wait")
+    print("Getting order details, please wait")
 
     order_details = driver.execute_async_script(getHumbleOrders.replace('%optional%',''))
     order_details = require_humble_orders(order_details, "the whole run")

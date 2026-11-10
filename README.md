@@ -26,7 +26,9 @@ To remove an already added account, delete the associated `.(humble|steam)cookie
 
 ### Dependencies
 
-Requires Python version 3.6 or above
+Requires Python 3.8 or above (selenium 4.10 needs it; known-good on 3.13 and 3.15).
+Optional but recommended: a Steam Web API key in `steam_api_key.txt`
+(https://steamcommunity.com/dev/apikey) for much faster ownership matching.
 
 - `steam`: [ValvePython/steam](https://github.com/ValvePython/steam)  
 - `fuzzywuzzy`: [seatgeek/fuzzywuzzy](https://github.com/seatgeek/fuzzywuzzy)  

@@ -3,4 +3,4 @@ python-Levenshtein>=0.25.0 # C-backed matching for fuzzywuzzy; without it fuzzyw
 requests>=2.25.1
 selenium>=4.10.0
 pwinput>=1.0.3
-steam @ git+https://github.com/FailSpy/steam-py-lib@master # patched steam python library using changes from artur1214 until fixed on main repo
+steam @ git+https://github.com/FailSpy/steam-py-lib@3db3cfe04fb16fc9c212244d96c86b5164905c82 # pinned fork (patched lib from artur1214, until fixed on the ValvePython/steam main repo); was floating on @master

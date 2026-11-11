@@ -1907,8 +1907,13 @@ def redeem_steam_keys(humble_session, humble_keys):
                 )
                 log(f"redeem_steam_keys: 53 persisted beyond {RATE_LIMIT_MAX_WAIT}s; aborting run")
                 sys.exit(1)
-            if seconds % 60 == 0:
-                # Try again every 60 seconds
+            if seconds % 600 == 0:
+                # NOTE: Steam counts EVERY activation POST as a recent attempt,
+                # so a once-a-minute probe inside the blocked window keeps
+                # re-arming it (seen live 2026-11-10: probing every 60s never
+                # let the failure window expire). Probe every 10 minutes so the
+                # window can actually drain; progress then resumes within at
+                # most 10 minutes of real clearance.
                 code = _redeem_steam(session, key["redeemed_key_val"], quiet=True)
 
         write_key(code, key)

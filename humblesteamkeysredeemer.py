@@ -1794,21 +1794,39 @@ def redeem_steam_keys(humble_session, humble_keys):
             log("redeem_steam_keys: attempt plan declined; no attempts made")
             return
 
-    redeemed = []
     attempted_any = False
+    # Title/appid -> the answer a sibling key reached. Only ownership-relevant
+    # verdicts transfer to later same-content keys; a sibling that merely
+    # errored (bad key code, activation hiccup) says nothing about a different
+    # key's content, and recording it as already-owned would lose a redemption.
+    sibling_codes = {}
 
     for key in unownedgames:
         title = key_title(key)
         print(title)
 
-        if title in redeemed or (key["steam_app_id"] != None and key["steam_app_id"] in redeemed):
-            # We've bumped into a repeat of the same game!
-            write_key(9,key)
-            continue
-        else:
-            if key["steam_app_id"] != None:
-                redeemed.append(key["steam_app_id"])
-            redeemed.append(title)
+        appid = key["steam_app_id"]
+        sibling_code = None
+        same_title_seen = title in sibling_codes
+        same_appid_seen = appid != None and appid in sibling_codes
+        if same_title_seen or same_appid_seen:
+            sibling_code = sibling_codes.get(title)
+            if sibling_code is None:
+                sibling_code = sibling_codes.get(appid)
+
+        if sibling_code is not None:
+            if sibling_code in (0, 9, 15):
+                # We've bumped into a repeat of content the account already
+                # has: skip and record without a second attempt.
+                write_key(9, key)
+                continue
+            # Fall through: the sibling errored, so this key gets judged on
+            # its own activation answer.
+
+        if title not in sibling_codes:
+            sibling_codes[title] = None
+        if appid != None and appid not in sibling_codes:
+            sibling_codes[appid] = None
 
         if "redeemed_key_val" not in key:
             # This key is unredeemed via Humble, trigger redemption process.
@@ -1864,6 +1882,10 @@ def redeem_steam_keys(humble_session, humble_keys):
                 code = _redeem_steam(session, key["redeemed_key_val"], quiet=True)
 
         write_key(code, key)
+        if sibling_codes.get(title) is None:
+            sibling_codes[title] = code
+        if appid != None and sibling_codes.get(appid) is None:
+            sibling_codes[appid] = code
 
 
 VERIFY_REPORT = "steam_keys_status.csv"

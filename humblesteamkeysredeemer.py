@@ -1020,6 +1020,52 @@ def steam_json(steam_session, url, what, **kwargs):
         return None
 
 
+# The full catalogue (appid -> store name) from the last catalogue fetch. The
+# redeem/verify/export paths reuse it to resolve titles Humble ships without a
+# steam_app_id -- exactly the keys a dead lookup cannot see.
+_STEAM_CATALOG_CACHE = {}
+
+
+def last_steam_catalog():
+    """The catalogue from the most recent fetch, as appid -> store name."""
+    return _STEAM_CATALOG_CACHE
+
+
+def build_catalog_name_index():
+    """One-time normalized-store-name -> appid map over the fetched catalogue."""
+    index = {}
+    for catalog_appid, catalog_name in _STEAM_CATALOG_CACHE.items():
+        normalized_name = normalize_title(catalog_name)
+        if normalized_name and normalized_name not in index:
+            index[normalized_name] = catalog_appid
+        # Bilingual store titles ("STRIDER / ストライダー飛竜"): the part before
+        # the slash is the western title, so index it as an alias too -- but
+        # only when the tail is a non-ASCII localization, not a second product
+        # name sharing the entry.
+        parts = re.split(r"\s*/\s*", str(catalog_name).strip())
+        if len(parts) > 1 and any(ord(c) > 127 for c in parts[-1]):
+            head = normalize_title(parts[0])
+            if head and head not in index:
+                index[head] = catalog_appid
+    return index
+
+
+def catalogue_owned_appid(catalog_names, title, owned_app_ids):
+    """The catalogue appid for `title`, but only when it is already owned.
+
+    Exact normalized store-name lookup only: fuzzy guessing here would skip
+    keys the user genuinely lacks, and every skipped key is a real redemption
+    lost. The caller is responsible for only consulting this when Humble
+    supplied no steam_app_id of its own.
+    """
+    if not catalog_names:
+        return None
+    candidate = catalog_names.get(normalize_title(title))
+    if candidate is not None and candidate in owned_app_ids:
+        return candidate
+    return None
+
+
 def fetch_steam_catalog(steam_session, api_key):
     # Paginated full catalogue via IStoreService/GetAppList. Returns appid -> name.
     params = {
@@ -1055,6 +1101,8 @@ def fetch_steam_catalog(steam_session, api_key):
 
     print(f"Fetched {len(catalog)} apps from the Steam catalogue.")
     log(f"catalogue fetched: {len(catalog)} apps")
+    _STEAM_CATALOG_CACHE.clear()
+    _STEAM_CATALOG_CACHE.update(catalog)
     return catalog
 
 
@@ -1273,12 +1321,18 @@ def get_owned_apps(steam_session, humble_name_by_appid=None):
     IPlayerService -- no signed-in session is touched, and steam_session may be
     None. Every other path needs it. owned_app_details is the appid -> name map
     for everything owned, or None when callers must fall back to per-title
-    searches.
+    searches. The full store catalogue (fetch_steam_catalog) is fetched in the
+    same pass when the API key allows it and left in _STEAM_CATALOG_CACHE for
+    the attempt gate.
     """
     api_key, steamid = load_steam_api_config()
     if api_key and steamid:
         webapi = fetch_owned_via_webapi(api_key, steamid)
         if webapi is not None:
+            # The catalogue still resolves titles Humble ships with no
+            # steam_app_id; without it the attempt gate has nothing to consult.
+            if api_key and not _STEAM_CATALOG_CACHE:
+                fetch_steam_catalog(steam_session or requests.Session(), api_key)
             return webapi
 
     if steam_session is None:
@@ -1438,7 +1492,9 @@ def normalize_title(title):
     text = unicodedata.normalize("NFKD", text)
     text = "".join(c for c in text if not unicodedata.combining(c))
     text = text.lower()
-    text = re.sub(r"\((?:[^)]*\b(?:steam|pc|key)\b[^)]*)\)", " ", text)
+    # "(Early Access)" is a Steam offer tag, not part of the game name: "GRAV
+    # (Early Access)" and "GRAV" are the same entry on the Steam side.
+    text = re.sub(r"\((?:[^)]*\b(?:steam|pc|key|early\s+access)\b[^)]*)\)", " ", text)
     text = text.replace("&", " and ")
     text = re.sub(r"[‐-―]", " ", text)
     text = re.sub(r"[^\w\s]", " ", text)
@@ -1633,6 +1689,8 @@ def redeem_steam_keys(humble_session, humble_keys):
     catalog_index = (
         build_ownership_index(owned_app_details) if owned_app_details is not None else None
     )
+    catalog_names = build_catalog_name_index()
+    catalogue_caught = 0
 
     for game in noted_keys:
         title = key_title(game)
@@ -1646,8 +1704,22 @@ def redeem_steam_keys(humble_session, humble_keys):
             candidates = owned_app_details
             index = catalog_index
 
-        verdict, score, appid = classify_ownership(index, game, INTERACTIVE_MATCHING)
-        matched_name = candidates.get(appid) if appid is not None else None
+        gate_appid = (
+            catalogue_owned_appid(catalog_names, title, owned_app_ids)
+            if (catalog_names and not game.get("steam_app_id"))
+            else None
+        )
+        if gate_appid is not None:
+            # Steam's own store catalogue names this entry and the account
+            # already owns that app; Humble just shipped the key without its
+            # id. Skipping costs no rate-limit quota, unlike learning it the
+            # hard way from an "already owned" activation failure.
+            verdict, score, appid = OWNED, 100, gate_appid
+            matched_name = last_steam_catalog().get(gate_appid)
+            catalogue_caught += 1
+        else:
+            verdict, score, appid = classify_ownership(index, game, INTERACTIVE_MATCHING)
+            matched_name = candidates.get(appid) if appid is not None else None
         report_rows.append((verdict, title, matched_name, appid, score))
 
         if verdict == OWNED and appid is not None:
@@ -1660,6 +1732,11 @@ def redeem_steam_keys(humble_session, humble_keys):
             unownedgames.append(game)
 
     write_ownership_report(report_rows)
+    if catalogue_caught:
+        print(
+            f"Catalogue name matching skipped {catalogue_caught} key(s) Steam already "
+            "owns by store name -- no attempts spent on them."
+        )
     log(
         f"ownership decisions: {len(skipped_games)} owned (skipped), "
         f"{len(uncertain_games)} uncertain (attempted), "
@@ -1701,6 +1778,21 @@ def redeem_steam_keys(humble_session, humble_keys):
         key=lambda g: (id(g) in uncertain_ids, order_index.get(id(g), 0)),
     )
 
+
+    if unownedgames and "--yes" not in sys.argv:
+        # The plan gate: show every intent BEFORE spending quota. "Already
+        # owned" answers count as failures against Steam's ~10-per-hour
+        # activation limit, so the user sees exactly what will be burned on.
+        print("About to attempt redeeming these keys:")
+        for planned in unownedgames:
+            print(f"    - {key_title(planned)}")
+        reply = input(
+            f"Proceed with {len(unownedgames)} attempts? [y/N] (pass --yes to skip this prompt) "
+        ).strip().lower()
+        if reply not in ("y", "yes"):
+            print("No attempts made. These keys stay in the pool for the next run.")
+            log("redeem_steam_keys: attempt plan declined; no attempts made")
+            return
 
     redeemed = []
     attempted_any = False
@@ -1801,6 +1893,7 @@ def verify_steam_keys(humble_keys):
     catalog_index = (
         build_ownership_index(owned_app_details) if owned_app_details is not None else None
     )
+    catalog_names = build_catalog_name_index()
     search_cache = {}
 
     # Same recorded-history maps the auto-redeem filter uses, per file, so the
@@ -1846,6 +1939,10 @@ def verify_steam_keys(humble_keys):
         if appid is not None:
             owned = "owned" if appid in owned_app_ids else "not-owned"
             source = "exact-appid"
+        elif catalogue_owned_appid(catalog_names, title, owned_app_ids) is not None:
+            # The store catalogue names this entry and the account already owns
+            # that app -- Humble shipped the key without its app id.
+            owned, source = "owned", "catalog-name"
         else:
             verdict, _score, _matched = classify_ownership(key_index, key)
             if verdict == OWNED:
@@ -1960,6 +2057,7 @@ def export_mode(humble_session,order_details):
                 owned_app_details = {}
     
     export_index = build_ownership_index(owned_app_details)
+    catalog_names = build_catalog_name_index()
 
     desired_keys = "steam_app_id" if export_steam_only else "key_type_human_name"
     keylist = list(find_dict_keys(order_details,desired_keys,True))
@@ -1976,6 +2074,12 @@ def export_mode(humble_session,order_details):
             if(owned_app_ids != None and "steam_app_id" in tpk):
                 # User requested Steam Ownership info
                 owned = tpk["steam_app_id"] in owned_app_ids
+                if(not owned and not tpk.get("steam_app_id")):
+                    # Humble shipped no app id; consult the store catalogue.
+                    gate_appid = catalogue_owned_appid(
+                        catalog_names, key_title(tpk), owned_app_ids
+                    )
+                    owned = gate_appid is not None
                 if(not owned):
                     # Do a search to see if user owns it
                     verdict, _score, _appid = classify_ownership(export_index, tpk)

@@ -33,6 +33,25 @@ that you in fact do not own. Nothing is redeemed in this mode; run it
 with no login prompt at all when the Web API key + SteamID64 pair is set.
 from the menu or with `python humblesteamkeysredeemer.py --verify`.
 
+### Attempt-gate (avoiding rate-limit burns)
+
+Failed Steam activations ("already owned", dead keys) count against a
+~10-per-hour limit, so before any key is attempted the tool exhausts what
+it can know without activating:
+
+- keys whose Humble `steam_app_id` is already owned are skipped;
+- for keys Humble ships **without** an app id, the app's own title is looked
+  up in the store catalogue fetched that run -- an exact store-name match
+  that you already own is skipped without spending quota (this catches
+  store-delisted entries that title matching against *owned names* cannot
+  see, including bilingual store names like `STRIDER / ストライダー飛竜`);
+- multi-product packs that no store name resolves ("Torchlight 1-3 Bundle")
+  and near-miss titles are still attempted: Steam's own activation answer is
+  the only oracle for those, and each answer is recorded so no key is ever
+  attempted twice.
+- before the attempts begin, the full intent list is printed with a
+  `[y/N]` confirm; pass `--yes` to skip that prompt.
+
 ### Notes
 
 To remove an already added account, delete the associated `.(humble|steam)cookies` file.

@@ -108,6 +108,13 @@ GETAPPS_DELAY = 0.3
 # Steam counts an already-owned key as a failed activation and allows only
 # ~10 failures an hour, so attempts are spaced rather than fired back to back.
 REDEEM_DELAY = 3
+# Steam occasionally answers the activation POST with connection-accepted and
+# then never sends a body. requests' default timeout is INFINITE, so without
+# this the run hangs forever on one key (seen live at 17:17 and 17:24 on
+# PAYDAY 2 - Lycanwulf...)
+STEAM_REDEEM_TIMEOUT = (30, 180)
+# Default for every other Steam API GET (catalog, userdata, GetApps, search).
+STEAM_API_TIMEOUT = 90
 
 # The 53 wait-loop below re-submits the same key roughly every minute.
 # Bound the whole wait: a lockout that outlasts this should end the run
@@ -773,8 +780,20 @@ def _redeem_steam(session, key, quiet=False):
         print("Error: Steam sessionid cookie missing. Sign in again.")
         return -1
     try:
-        r = session.post(STEAM_REDEEM_API, data={"product_key": key, "sessionid": session_id})
+        r = session.post(
+            STEAM_REDEEM_API,
+            data={"product_key": key, "sessionid": session_id},
+            timeout=STEAM_REDEEM_TIMEOUT,
+        )
         blob = r.json()
+    except requests.Timeout:
+        # A timeout is not proof the key was not processed: Steam may have
+        # accepted it and just never answered. Returning -2 stops the run and
+        # leaves THIS key unrecorded so a later run re-asks (the next answer
+        # then reflects whatever Steam actually did with it).
+        print(f"Steam accepted the activation request but did not answer within {STEAM_REDEEM_TIMEOUT[1]}s.")
+        log("steam activation timeout (no body within deadline)")
+        return -2
     except ValueError as e:
         if not quiet:
             print(f"Error: Steam activation returned a non-JSON response: {e}")
@@ -1007,6 +1026,9 @@ def fetch_owned_via_webapi(api_key, steamid):
 def steam_json(steam_session, url, what, **kwargs):
     # Steam hands back HTML error pages and empty bodies often enough that a bare
     # .json() turns every hiccup into an unreadable JSONDecodeError traceback.
+    # Requests' default timeout is infinite; a wedged server would hang the
+    # whole run, so every GET gets a deadline unless the caller supplies one.
+    kwargs.setdefault("timeout", STEAM_API_TIMEOUT)
     try:
         resp = steam_session.get(url, **kwargs)
     except requests.RequestException as e:
@@ -1853,6 +1875,14 @@ def redeem_steam_keys(humble_session, humble_keys):
             print("Steam did not answer the activation request with JSON (most likely the web session expired mid-run).")
             print("Stopping here. Keys redeemed so far are recorded; rerun later to continue.")
             log(f"redeem_steam_keys: non-retryable Steam response at {key_title(key)}; aborting run")
+            sys.exit(1)
+        if code == -2:
+            # Connection accepted but no body within the deadline. Unlike -1
+            # this DOES consume the attempt server-side possibly; the key
+            # stays unrecorded, so a rerun re-asks and the next answer (0, 9,
+            # or a real error) reflects what Steam actually did.
+            print("Stopping here. This key was not recorded; rerun later to re-ask it.")
+            log(f"redeem_steam_keys: activation timed out at {key_title(key)}; aborting run")
             sys.exit(1)
         animation = "|/-\\"
         seconds = 0
